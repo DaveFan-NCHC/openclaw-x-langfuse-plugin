@@ -1,0 +1,26 @@
+{
+  "id": "langfuse-bridge",
+  "name": "Langfuse Bridge",
+  "description": "Forwards OpenClaw model usage diagnostics to Langfuse",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "publicKey": {
+        "type": "string",
+        "description": "Langfuse public key (pk-lf-...). Falls back to LANGFUSE_PUBLIC_KEY."
+      },
+      "secretKey": {
+        "type": "string",
+        "description": "Langfuse secret key (sk-lf-...). Falls back to LANGFUSE_SECRET_KEY."
+      },
+      "baseUrl": {
+        "type": "string",
+        "description": "Langfuse host. Falls back to LANGFUSE_BASE_URL, then https://cloud.langfuse.com."
+      }
+    }
+  }
+}

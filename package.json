@@ -1,0 +1,63 @@
+{
+  "name": "openclaw-x-langfuse-plugin",
+  "version": "1.0.0",
+  "description": "Forward OpenClaw model usage diagnostics to Langfuse",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "mapping.js",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "runtimeExtensions": [
+      "./index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.28"
+    },
+    "build": {
+      "openclawVersion": "2026.5.28"
+    },
+    "install": {
+      "clawhubSpec": "clawhub:openclaw-x-langfuse-plugin",
+      "npmSpec": "openclaw-x-langfuse-plugin",
+      "defaultChoice": "clawhub",
+      "minHostVersion": ">=2026.5.28"
+    },
+    "release": {
+      "publishToClawHub": true,
+      "publishToNpm": true
+    }
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "langfuse",
+    "observability",
+    "llm",
+    "tracing",
+    "diagnostics"
+  ],
+  "author": "Caleb Seeling <caleb.seeling@clickhouse.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/langfuse/openclaw-x-langfuse-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/langfuse/openclaw-x-langfuse-plugin/issues"
+  },
+  "homepage": "https://github.com/langfuse/openclaw-x-langfuse-plugin#readme",
+  "dependencies": {
+    "langfuse": "^3.38.20"
+  }
+}
