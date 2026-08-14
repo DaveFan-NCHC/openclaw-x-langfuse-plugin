@@ -126,7 +126,11 @@ export function createTraceEngine(tracing, opts = {}) {
       if (!oldest || entry.lastMs < oldest.lastMs) oldest = entry;
     }
     if (!oldest) return;
-    if (oldest.kind === "root") finalizeTrace(oldest);
+    if (oldest.ended) forget(oldest);
+    else if (oldest.kind === "root") {
+      finalizeTrace(oldest);
+      if (oldest.ended) forget(oldest);
+    }
     else endEntry(oldest, now());
   }
 
@@ -140,6 +144,7 @@ export function createTraceEngine(tracing, opts = {}) {
       root.runId = evt.runId;
       root.ctx.runId = evt.runId;
       rootsByRun.set(evt.runId, root);
+      generationsByRun.set(evt.runId, root.generations);
     }
     if (!root.named && evt?.channel) {
       root.named = true;
@@ -194,6 +199,7 @@ export function createTraceEngine(tracing, opts = {}) {
         agentId: evt?.agentId,
       },
       children: new Set(),
+      generations: [],
       runCompleted: false,
       agentEnded: false,
       finalizeScheduled: false,
@@ -204,7 +210,10 @@ export function createTraceEngine(tracing, opts = {}) {
       ended: false,
     });
     if (tid) rootsByTrace.set(tid, root);
-    if (runId) rootsByRun.set(runId, root);
+    if (runId) {
+      rootsByRun.set(runId, root);
+      generationsByRun.set(runId, root.generations);
+    }
     return root;
   }
 
@@ -342,7 +351,11 @@ export function createTraceEngine(tracing, opts = {}) {
     return entry;
   }
 
-  function generationList(runId) {
+  function generationList(runId, root) {
+    if (root) {
+      if (runId) generationsByRun.set(runId, root.generations);
+      return root.generations;
+    }
     if (!runId) return [];
     let list = generationsByRun.get(runId);
     if (!list) {
@@ -352,7 +365,7 @@ export function createTraceEngine(tracing, opts = {}) {
     return list;
   }
 
-  function createGeneration(evt, root, attributes = {}) {
+  function createGeneration(evt, root, attributes = {}, startMs = evt?.ts) {
     const entry = createChild(evt, root, {
       name: evt?.model ?? "model",
       asType: "generation",
@@ -361,28 +374,54 @@ export function createTraceEngine(tracing, opts = {}) {
         ...attributes,
         metadata: compact({ provider: evt?.provider, runId: evt?.runId }),
       }),
-      startMs: evt?.ts,
+      startMs,
     });
     entry.inputSet = attributes.input !== undefined;
     entry.outputSet = attributes.output !== undefined;
-    entry.sequence = generationList(evt?.runId).length + 1;
-    generationList(evt?.runId).push(entry);
+    entry.outputEventReceived = attributes.output !== undefined;
+    entry.diagnosticCompleted = false;
+    const list = generationList(evt?.runId, root);
+    entry.sequence = list.length + 1;
+    list.push(entry);
     return entry;
   }
 
   function generationForOutput(evt, root) {
-    const list = generationList(evt?.runId);
-    const match = list.find((entry) => !entry.outputSet && !entry.ended);
+    const list = generationList(evt?.runId, root);
+    const match = list.find((entry) => !entry.outputEventReceived && !entry.ended);
     return match ?? createGeneration(evt, root);
+  }
+
+  function finishTool(entry, root) {
+    if (!entry || entry.ended || !entry.diagnosticTerminal) return;
+    // Async diagnostics normally preserve started -> terminal ordering, but a
+    // delayed/dropped start must not let a terminal hook close the span before
+    // a late started event can enrich it. run.completed is the bounded fallback.
+    if (!entry.diagnosticStarted && root && !root.runCompleted) return;
+    applyToolIO(entry, fallbackToolIO(root, entry.toolCallId));
+    endEntry(entry, entry.completedMs ?? now(), true);
+  }
+
+  function finishGeneration(entry) {
+    if (!entry || entry.ended || !entry.diagnosticCompleted) return;
+    if (entry.expectsHookIO && (!entry.inputSet || !entry.outputEventReceived)) return;
+    endEntry(entry, entry.diagnosticCompletedMs ?? entry.completedMs ?? now());
   }
 
   function finishRootChildren(root) {
     for (const child of [...root.children]) {
       if (child.ended) continue;
       if (child.kind === "tool" || child.kind === "retriever") {
-        applyToolIO(child, fallbackToolIO(root, child.toolCallId));
+        // Tool diagnostics own status and end timing. When hooks participated,
+        // keep the observation open until both streams have reached terminal.
+        if (!child.diagnosticTerminal) continue;
+        if (child.hookStarted && !child.hookTerminal) continue;
+        finishTool(child, root);
+      } else if (child.kind === "generation") {
+        // A root may end before the outer model.usage event. Do not close a
+        // hook-created generation until that diagnostic has supplied usage/cost.
+        finishGeneration(child);
       }
-      endEntry(child, child.completedMs ?? root.endMs ?? now(), true);
     }
   }
 
@@ -415,29 +454,20 @@ export function createTraceEngine(tracing, opts = {}) {
     if (!root.finalizeScheduled) {
       root.finalizeScheduled = true;
       defer(() => {
-        if ((!conversationHooksEnabled || root.agentEnded) && !root.pendingUsage) {
+        if (!conversationHooksEnabled || root.agentEnded) {
           finalizeTrace(root);
         }
       });
     }
   }
 
-  function onModelUsage(evt, allowDefer = true) {
+  function onModelUsage(evt) {
     const root = ensureRoot(evt);
-    const candidates = root?.runId ? generationList(root.runId) : [];
-    let entry = candidates.at(-1);
+    const candidates = root ? generationList(root.runId, root) : generationList(evt?.runId);
+    let entry = candidates.findLast((candidate) => !candidate.ended);
     let content;
-    if (allowDefer && root && conversationHooksEnabled && !entry) {
-      root.pendingUsage = evt;
-      defer(() => {
-        if (root.pendingUsage !== evt) return;
-        root.pendingUsage = undefined;
-        onModelUsage(evt, false);
-        if (root.agentEnded) finalizeTrace(root);
-      });
-      return;
-    }
     if (!entry) {
+      const expectsHookIO = conversationHooksEnabled && Boolean(root || evt?.runId);
       if (root) content = fallbackContent(root);
       else if (captureConversationContent) {
         try {
@@ -449,8 +479,13 @@ export function createTraceEngine(tracing, opts = {}) {
       entry = createGeneration(
         evt,
         root,
-        compact({ input: content?.input, output: content?.output }),
+        expectsHookIO
+          ? {}
+          : compact({ input: content?.input, output: content?.output }),
+        typeof evt.durationMs === "number" ? evt.ts - evt.durationMs : evt.ts,
       );
+      entry.syntheticUsage = expectsHookIO;
+      entry.expectsHookIO = expectsHookIO;
       entry.completedMs = evt.ts;
     }
 
@@ -477,16 +512,17 @@ export function createTraceEngine(tracing, opts = {}) {
       // best-effort
     }
 
-    for (const generation of candidates.length > 0 ? candidates : [entry]) {
-      if (!generation.ended && (generation.outputSet || candidates.length === 0)) {
-        endEntry(generation, generation.completedMs ?? evt.ts, true);
-      }
-    }
     if (root) updateRootIO(root, content);
     else {
       const io = compact({ input: content?.input, output: content?.output });
       if (Object.keys(io).length > 0) entry.obs.setTraceIO?.(io);
-      endEntry(entry, evt.ts, true);
+    }
+
+    const turnGenerations = candidates.length > 0 ? candidates : [entry];
+    for (const generation of turnGenerations) {
+      generation.diagnosticCompleted = true;
+      generation.diagnosticCompletedMs = evt.ts;
+      finishGeneration(generation);
     }
   }
 
@@ -499,17 +535,18 @@ export function createTraceEngine(tracing, opts = {}) {
         attributes: errorAttributes(evt),
       }),
       evt.ts,
-      true,
     );
   }
 
   function onToolStarted(evt) {
     const entry = ensureTool(evt, "diagnostic-start");
+    entry.diagnosticStarted = true;
     try {
       entry.obs.update(toolAttributes(evt));
     } catch {
       // best-effort
     }
+    if (entry.diagnosticTerminal && entry.hookTerminal) finishTool(entry, entry.root);
   }
 
   function onToolTerminal(evt) {
@@ -536,16 +573,12 @@ export function createTraceEngine(tracing, opts = {}) {
       // best-effort
     }
     if (isError) applyToolIO(entry, { isError: true });
-    if (!root) {
+    if (entry.hookTerminal || (!entry.hookStarted && root?.runCompleted)) {
+      finishTool(entry, root);
+    } else if (!root) {
       defer(() => {
-        if (!entry.hookTerminal) {
-          applyToolIO(entry, fallbackToolIO(null, entry.toolCallId));
-          endEntry(entry, entry.completedMs ?? now(), true);
-        }
+        if (!entry.hookStarted) finishTool(entry, null);
       });
-    } else if (root.runCompleted && !conversationHooksEnabled) {
-      applyToolIO(entry, fallbackToolIO(root, entry.toolCallId));
-      endEntry(entry, entry.completedMs, true);
     }
   }
 
@@ -558,7 +591,6 @@ export function createTraceEngine(tracing, opts = {}) {
         attributes: compact({ ...contextAttributes(evt), output: contextSummary(evt) }),
       }),
       evt.ts,
-      true,
     );
   }
 
@@ -567,6 +599,7 @@ export function createTraceEngine(tracing, opts = {}) {
   function onBeforeAgentRun(evt) {
     const root = ensureRoot(evt);
     if (!root || !captureConversationContent) return;
+    root.agentStartMessageCount = Array.isArray(evt.messages) ? evt.messages.length : undefined;
     updateRootIO(root, { input: evt.prompt }, true);
     try {
       root.obs.update({
@@ -584,8 +617,10 @@ export function createTraceEngine(tracing, opts = {}) {
   function onLlmInput(evt) {
     const root = ensureRoot(evt);
     if (!captureConversationContent) return;
-    const list = generationList(evt.runId);
-    let entry = list.find((item) => item.syntheticOutput && !item.inputSet);
+    const list = generationList(evt.runId, root);
+    let entry = list.find(
+      (item) => !item.ended && !item.inputSet && (item.syntheticOutput || item.syntheticUsage),
+    );
     const input = clean(
       compact({
         systemPrompt: evt.systemPrompt,
@@ -599,12 +634,15 @@ export function createTraceEngine(tracing, opts = {}) {
     else {
       entry.inputSet = true;
       entry.syntheticOutput = false;
+      entry.syntheticUsage = false;
       try {
         entry.obs.update({ input });
       } catch {
         // best-effort
       }
+      finishGeneration(entry);
     }
+    entry.expectsHookIO = true;
     updateRootIO(root, { input: evt.prompt });
   }
 
@@ -612,8 +650,10 @@ export function createTraceEngine(tracing, opts = {}) {
     const root = ensureRoot(evt);
     if (!captureConversationContent) return;
     const entry = generationForOutput(evt, root);
+    entry.expectsHookIO = true;
     const output = outputFromLlmEvent(evt);
     entry.outputSet = output !== undefined;
+    entry.outputEventReceived = true;
     entry.syntheticOutput = !entry.inputSet;
     entry.completedMs = evt.ts;
     entry.hookUsageSet = evt.usage !== undefined;
@@ -633,6 +673,7 @@ export function createTraceEngine(tracing, opts = {}) {
     } catch {
       // best-effort
     }
+    finishGeneration(entry);
     const finalText = Array.isArray(evt.assistantTexts)
       ? evt.assistantTexts.filter((text) => typeof text === "string" && text.trim()).at(-1)
       : undefined;
@@ -652,8 +693,14 @@ export function createTraceEngine(tracing, opts = {}) {
     const root = ensureRoot(evt);
     if (!root) return;
     root.agentEnded = true;
-    root.endMs ??= evt.ts;
-    const output = captureConversationContent ? lastAssistantText(evt.messages) : undefined;
+    let output;
+    if (captureConversationContent && evt.success !== false && !root.outputSet) {
+      const messages = Array.isArray(evt.messages) ? evt.messages : [];
+      const currentTurnMessages = Number.isInteger(root.agentStartMessageCount)
+        ? messages.slice(root.agentStartMessageCount)
+        : messages;
+      output = lastAssistantText(currentTurnMessages);
+    }
     if (output) updateRootIO(root, { output }, true);
     try {
       root.obs.update({
@@ -668,12 +715,9 @@ export function createTraceEngine(tracing, opts = {}) {
     } catch {
       // best-effort
     }
-    // model.usage is emitted just after the harness/agent hooks settle. Defer
-    // ending the OTel observations so aggregate usage/cost can still be set on
-    // the final generation before its span closes.
-    defer(() => {
-      if (!root.pendingUsage) finalizeTrace(root);
-    });
+    // run.completed remains authoritative for the root end timestamp. Agent
+    // hooks only make its I/O complete; they never end a run on their own.
+    if (root.runCompleted) defer(() => finalizeTrace(root));
   }
 
   function onBeforeToolCall(evt) {
@@ -696,7 +740,7 @@ export function createTraceEngine(tracing, opts = {}) {
   function onAfterToolCall(evt) {
     const entry = ensureTool(evt, "hook-after");
     entry.hookTerminal = true;
-    entry.completedMs = evt.ts;
+    entry.hookCompletedMs = evt.ts;
     const isError = Boolean(evt.error);
     if (captureToolContent) {
       applyToolIO(
@@ -722,7 +766,7 @@ export function createTraceEngine(tracing, opts = {}) {
     } catch {
       // best-effort
     }
-    endEntry(entry, evt.ts, true);
+    if (entry.diagnosticTerminal) finishTool(entry, entry.root);
   }
 
   function handle(evt) {

@@ -22,16 +22,29 @@ function fakeTracing() {
       traceIO: undefined,
       ended: false,
       endTime: undefined,
+      ignoredUpdates: [],
     };
     all.push(node);
     const handle = {
-      otelSpan: { setAttribute: (k, v) => (spanAttrs[k] = v) },
+      otelSpan: {
+        setAttribute(k, v) {
+          if (node.ended) {
+            node.ignoredUpdates.push({ [k]: v });
+            return;
+          }
+          spanAttrs[k] = v;
+        },
+      },
       startObservation(n, a, o) {
         const child = make(n, a, o, node);
         node.children.push(child);
         return child.handle;
       },
       update(u) {
+        if (node.ended) {
+          node.ignoredUpdates.push(u);
+          return handle;
+        }
         // Mirror the real SDK: metadata merges additively across updates; other
         // attributes (including name) overwrite.
         const { metadata, ...rest } = u ?? {};
@@ -41,10 +54,15 @@ function fakeTracing() {
         return handle;
       },
       setTraceIO(io) {
+        if (node.ended) {
+          node.ignoredUpdates.push({ traceIO: io });
+          return handle;
+        }
         node.traceIO = io;
         return handle;
       },
       end(t) {
+        if (node.ended) return;
         node.ended = true;
         node.endTime = t;
       },
@@ -88,7 +106,7 @@ function runSequence() {
     { type: "tool.execution.started", ts: 1100, runId: "r1", toolName: "web_search", toolCallId: "tc1", toolSource: "core", trace: { traceId: TRACE, spanId: "T1", parentSpanId: "RUN" } },
     { type: "tool.execution.completed", ts: 1200, runId: "r1", toolName: "web_search", toolCallId: "tc1", durationMs: 100, trace: { traceId: TRACE, spanId: "T1", parentSpanId: "RUN" } },
     { type: "run.completed", ts: 1400, runId: "r1", sessionId: "s1", channel: "webchat", durationMs: 400, outcome: "completed", trace: { traceId: TRACE, spanId: "RUN", parentSpanId: "HARNESS" } },
-    { type: "model.usage", ts: 1410, sessionId: "s1", agentId: "main", channel: "webchat", model: "claude-opus-4-8", provider: "anthropic", usage: { input: 100, output: 50, total: 150 }, costUsd: 0.002, trace: { traceId: TRACE, spanId: "USAGE", parentSpanId: "HARNESS" } },
+    { type: "model.usage", ts: 1410, durationMs: 400, sessionId: "s1", agentId: "main", channel: "webchat", model: "claude-opus-4-8", provider: "anthropic", usage: { input: 100, output: 50, total: 150 }, costUsd: 0.002, trace: { traceId: TRACE, spanId: "USAGE", parentSpanId: "HARNESS" } },
   ];
 }
 
@@ -139,6 +157,8 @@ test("the generation (model.usage, post-run.completed) nests under the run's tra
   assert.deepEqual(gen.attributes.usageDetails, { input: 100, output: 50, total: 150 });
   assert.deepEqual(gen.attributes.costDetails, { totalCost: 0.002 });
   assert.equal(gen.attributes.input, "q");
+  assert.equal(gen.opts.startTime.getTime(), 1010);
+  assert.equal(gen.endTime.getTime(), 1410);
   assert.equal(gen.ended, true);
 });
 
@@ -360,6 +380,7 @@ test("blocked and failed tools are ERROR observations", () => {
   engine.handleHook("before_tool_call", { toolName: "bash", toolCallId: "failed", params: { command: "false" } }, ctx);
   engine.handleHook("after_tool_call", { toolName: "bash", toolCallId: "failed", error: "exit 1", durationMs: 4 }, ctx);
   engine.handle({ type: "tool.execution.blocked", ts: 10, runId: "re", toolName: "write", toolCallId: "blocked", deniedReason: "policy", trace: { traceId: "TE" } });
+  engine.handle({ type: "run.completed", ts: 11, runId: "re", outcome: "blocked", trace: { traceId: "TE" } });
   engine.handleHook("agent_end", { runId: "re", success: false, error: "blocked", messages: [] }, ctx);
   feed([]);
 
@@ -367,6 +388,176 @@ test("blocked and failed tools are ERROR observations", () => {
   assert.equal(t.byName("write").attributes.level, "ERROR");
   assert.equal(t.byName("write").ended, true);
   assert.equal(t.roots()[0].attributes.level, "ERROR");
+});
+
+test("model.usage can update a hook generation after the diagnostic root is finalized", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "ru", sessionId: "su", trace: { traceId: "TU" } };
+
+  engine.handle({ type: "run.started", ts: 10, ...ctx });
+  engine.handleHook("llm_input", { model: "m", prompt: "q", historyMessages: [] }, ctx);
+  engine.handleHook("agent_end", {
+    success: true,
+    messages: [{ role: "assistant", content: "a" }],
+  }, ctx);
+  assert.equal(t.roots()[0].ended, false, "agent_end cannot terminate a diagnostic run");
+  engine.handleHook("llm_output", {
+    model: "m",
+    assistantTexts: ["a"],
+    usage: { input: 1, output: 1 },
+  }, ctx);
+  engine.handle({ type: "run.completed", ts: 20, outcome: "completed", ...ctx });
+  feed([]);
+
+  const root = t.roots()[0];
+  const generation = t.all.find((node) => node.opts.asType === "generation");
+  assert.equal(root.ended, true);
+  assert.equal(generation.ended, false, "usage/cost diagnostic still owns generation completion");
+
+  engine.handle({
+    type: "model.usage",
+    ts: 25,
+    model: "m",
+    usage: { input: 10, output: 5 },
+    costUsd: 0.25,
+    trace: { traceId: "TU" },
+  });
+
+  assert.deepEqual(generation.attributes.usageDetails, { input: 10, output: 5 });
+  assert.deepEqual(generation.attributes.costDetails, { totalCost: 0.25 });
+  assert.equal(generation.ended, true);
+  assert.equal(generation.ignoredUpdates.length, 0);
+});
+
+test("after_tool_call enriches but diagnostic terminal owns status, timing, and end", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "rt", sessionId: "st", trace: { traceId: "TT" } };
+
+  engine.handleHook(
+    "before_tool_call",
+    { toolName: "edit", toolCallId: "tc", params: { path: "a.txt" } },
+    ctx,
+  );
+  engine.handleHook(
+    "after_tool_call",
+    { toolName: "edit", toolCallId: "tc", result: "partial result" },
+    ctx,
+  );
+  const tool = t.byName("edit");
+  assert.equal(tool.ended, false);
+
+  engine.handle({
+    type: "tool.execution.error",
+    ts: 50,
+    durationMs: 12,
+    errorCategory: "runtime",
+    toolName: "edit",
+    toolCallId: "tc",
+    ...ctx,
+  });
+  assert.equal(tool.ended, false, "a reversed diagnostic start can still enrich the tool");
+  engine.handle({
+    type: "tool.execution.started",
+    ts: 38,
+    toolName: "edit",
+    toolCallId: "tc",
+    toolSource: "core",
+    ...ctx,
+  });
+
+  assert.equal(tool.attributes.level, "ERROR");
+  assert.equal(tool.attributes.metadata.durationMs, 12);
+  assert.equal(tool.endTime.getTime(), 50);
+  assert.equal(tool.ended, true);
+  assert.equal(tool.ignoredUpdates.length, 0);
+});
+
+test("a tool stays open across root finalization until its delayed after hook arrives", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "rdelay", sessionId: "sdelay", trace: { traceId: "TDELAY" } };
+
+  engine.handleHook(
+    "before_tool_call",
+    { toolName: "search", toolCallId: "delayed", params: { q: "fresh" } },
+    ctx,
+  );
+  engine.handle({
+    type: "tool.execution.started",
+    ts: 10,
+    toolName: "search",
+    toolCallId: "delayed",
+    ...ctx,
+  });
+  engine.handle({
+    type: "tool.execution.completed",
+    ts: 20,
+    durationMs: 10,
+    toolName: "search",
+    toolCallId: "delayed",
+    ...ctx,
+  });
+  engine.handle({ type: "run.completed", ts: 30, outcome: "completed", ...ctx });
+  engine.handleHook("agent_end", { success: true, messages: [] }, ctx);
+  feed([]);
+
+  const tool = t.byName("search");
+  assert.equal(t.roots()[0].ended, true);
+  assert.equal(tool.ended, false);
+
+  engine.handleHook(
+    "after_tool_call",
+    { toolName: "search", toolCallId: "delayed", result: "fresh result" },
+    ctx,
+  );
+  assert.equal(tool.attributes.output, "fresh result");
+  assert.equal(tool.endTime.getTime(), 20);
+  assert.equal(tool.ended, true);
+  assert.equal(tool.ignoredUpdates.length, 0);
+});
+
+test("an empty llm_output consumes its own generation slot", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "rempty", sessionId: "sempty", trace: { traceId: "TEMPTY" } };
+
+  engine.handleHook("llm_input", { model: "m", prompt: "first", historyMessages: [] }, ctx);
+  engine.handleHook("llm_output", { model: "m", assistantTexts: [] }, ctx);
+  engine.handleHook("llm_input", { model: "m", prompt: "second", historyMessages: [] }, ctx);
+  engine.handleHook("llm_output", { model: "m", assistantTexts: ["answer"] }, ctx);
+  engine.handle({
+    type: "model.usage",
+    ts: 30,
+    model: "m",
+    usage: { input: 4, output: 1 },
+    trace: { traceId: "TEMPTY" },
+  });
+
+  const generations = t.all.filter((node) => node.opts.asType === "generation");
+  assert.equal(generations.length, 2);
+  assert.equal(generations[0].attributes.input.prompt, "first");
+  assert.equal(generations[0].attributes.output, undefined);
+  assert.equal(generations[1].attributes.input.prompt, "second");
+  assert.equal(generations[1].attributes.output, "answer");
+});
+
+test("failed agent_end does not reuse an assistant response from an earlier turn", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "rf", sessionId: "sf", trace: { traceId: "TF" } };
+  const history = [{ role: "assistant", content: "old answer" }];
+
+  engine.handleHook("before_agent_run", { prompt: "new question", messages: history }, ctx);
+  engine.handle({ type: "run.completed", ts: 10, outcome: "error", ...ctx });
+  engine.handleHook("agent_end", { success: false, error: "aborted", messages: history }, ctx);
+  feed([]);
+
+  const root = t.roots()[0];
+  assert.deepEqual(root.traceIO, { input: "new question" });
+  assert.equal(root.attributes.metadata.noAnswer, true);
+  assert.equal(root.attributes.level, "ERROR");
 });
 
 test("multiple llm hook pairs create separate generations", () => {
