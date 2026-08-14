@@ -453,11 +453,7 @@ export function createTraceEngine(tracing, opts = {}) {
     }
     if (!root.finalizeScheduled) {
       root.finalizeScheduled = true;
-      defer(() => {
-        if (!conversationHooksEnabled || root.agentEnded) {
-          finalizeTrace(root);
-        }
-      });
+      defer(() => finalizeTrace(root));
     }
   }
 

@@ -21,6 +21,7 @@ function fakeTracing() {
       spanAttrs,
       traceIO: undefined,
       ended: false,
+      endCalls: 0,
       endTime: undefined,
       ignoredUpdates: [],
     };
@@ -62,6 +63,7 @@ function fakeTracing() {
         return handle;
       },
       end(t) {
+        node.endCalls += 1;
         if (node.ended) return;
         node.ended = true;
         node.endTime = t;
@@ -85,11 +87,15 @@ function fakeTracing() {
 function makeEngine(t, opts = {}) {
   const deferred = [];
   const engine = createTraceEngine(t, { defer: (fn) => deferred.push(fn), ...opts });
+  const flushDeferred = () => {
+    while (deferred.length) deferred.shift()();
+  };
   return {
     engine,
+    flushDeferred,
     feed(events) {
       for (const e of events) engine.handle(e);
-      while (deferred.length) deferred.shift()(); // run safety-net finalizers
+      flushDeferred(); // run safety-net finalizers
     },
   };
 }
@@ -112,6 +118,91 @@ function runSequence() {
 
 const ioResolver = () => ({
   tc1: { name: "web_search", input: '{"q":"x"}', output: "result text", isError: false },
+});
+
+test("run.completed finalizes with conversation hooks enabled when agent_end is missing", () => {
+  const t = fakeTracing();
+  const { engine, flushDeferred } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "r-no-end", sessionId: "s-no-end", trace: { traceId: "T-NO-END" } };
+
+  engine.handle({ type: "run.started", ts: 10, ...ctx });
+  engine.handle({ type: "run.completed", ts: 20, outcome: "completed", ...ctx });
+  assert.equal(t.roots()[0].ended, false, "finalization remains deferred");
+
+  flushDeferred();
+  assert.equal(t.roots()[0].ended, true);
+  assert.equal(t.roots()[0].endCalls, 1);
+});
+
+test("agent_end before run.completed preserves I/O and finalizes only once", () => {
+  const t = fakeTracing();
+  const { engine, flushDeferred } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "r-agent-first", sessionId: "s-agent-first", trace: { traceId: "T-AGENT-FIRST" } };
+
+  engine.handleHook("before_agent_run", { prompt: "question", messages: [] }, ctx);
+  engine.handleHook(
+    "agent_end",
+    { success: true, messages: [{ role: "assistant", content: "answer" }] },
+    ctx,
+  );
+  assert.equal(t.roots()[0].ended, false, "agent_end does not own run completion");
+
+  engine.handle({ type: "run.completed", ts: 20, outcome: "completed", ...ctx });
+  flushDeferred();
+
+  assert.deepEqual(t.roots()[0].traceIO, { input: "question", output: "answer" });
+  assert.equal(t.roots()[0].endCalls, 1);
+});
+
+test("agent_end in the run.completed deferred window preserves I/O and finalizes only once", () => {
+  const t = fakeTracing();
+  const { engine, flushDeferred } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "r-run-first", sessionId: "s-run-first", trace: { traceId: "T-RUN-FIRST" } };
+
+  engine.handleHook("before_agent_run", { prompt: "question", messages: [] }, ctx);
+  engine.handle({ type: "run.completed", ts: 20, outcome: "completed", ...ctx });
+  engine.handleHook(
+    "agent_end",
+    { success: true, messages: [{ role: "assistant", content: "answer" }] },
+    ctx,
+  );
+  flushDeferred();
+
+  assert.deepEqual(t.roots()[0].traceIO, { input: "question", output: "answer" });
+  assert.equal(t.roots()[0].endCalls, 1);
+});
+
+test("run.completed keeps its existing finalize behavior when conversation hooks are disabled", () => {
+  const t = fakeTracing();
+  const { engine, flushDeferred } = makeEngine(t, { conversationHooksEnabled: false });
+  const ctx = { runId: "r-disabled", sessionId: "s-disabled", trace: { traceId: "T-DISABLED" } };
+
+  engine.handle({ type: "run.started", ts: 10, ...ctx });
+  engine.handle({ type: "run.completed", ts: 20, outcome: "completed", ...ctx });
+  flushDeferred();
+
+  assert.equal(t.roots()[0].ended, true);
+  assert.equal(t.roots()[0].endCalls, 1);
+});
+
+test("a normally completed trace finalizes before any TTL sweep", () => {
+  let clock = 1_000;
+  const t = fakeTracing();
+  const { engine, flushDeferred } = makeEngine(t, {
+    conversationHooksEnabled: true,
+    now: () => clock,
+    ttlMs: 5 * 60_000,
+  });
+  const ctx = { runId: "r-no-sweep", sessionId: "s-no-sweep", trace: { traceId: "T-NO-SWEEP" } };
+
+  engine.handle({ type: "run.started", ts: clock, ...ctx });
+  engine.handle({ type: "run.completed", ts: clock + 10, outcome: "completed", ...ctx });
+  flushDeferred();
+
+  assert.equal(t.roots()[0].ended, true, "deferred completion does not wait for the TTL reaper");
+  clock += 5 * 60_000;
+  engine.sweep();
+  assert.equal(t.roots()[0].endCalls, 1, "a later sweep cannot finalize the root again");
 });
 
 test("a full turn builds one trace with everything under a single root", () => {
