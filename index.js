@@ -16,8 +16,8 @@
 // privileged capability the runtime injects only for the bundled
 // `diagnostics-otel`/`diagnostics-prometheus` services (it carries captured
 // prompt/response private data); third-party plugins never receive it. The
-// public listener delivers the same event bodies (minus private data), which
-// is all this bridge needs — every field we map lives on the event itself.
+// public listener provides trace structure, timing, usage, and status. Typed
+// plugin hooks provide raw I/O when the operator explicitly grants access.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import {
@@ -31,7 +31,7 @@ import {
   setLangfuseTracerProvider,
 } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
-import { makeContentResolver, makeToolIOResolver } from "./transcript.js";
+import { makeTranscriptResolvers } from "./transcript.js";
 
 const DEFAULT_BASE_URL = "https://cloud.langfuse.com";
 
@@ -50,10 +50,15 @@ function resolveConfig(pluginConfig) {
     publicKey: cfg.publicKey ?? process.env.LANGFUSE_PUBLIC_KEY,
     secretKey: cfg.secretKey ?? process.env.LANGFUSE_SECRET_KEY,
     baseUrl: cfg.baseUrl ?? process.env.LANGFUSE_BASE_URL ?? DEFAULT_BASE_URL,
+    captureConversationContent: cfg.captureConversationContent !== false,
+    captureToolContent: cfg.captureToolContent !== false,
+    transcriptFallback: cfg.transcriptFallback !== false,
+    maxContentBytes:
+      typeof cfg.maxContentBytes === "number" ? cfg.maxContentBytes : 64_000,
   };
 }
 
-function createLangfuseBridgeService(getPluginConfig) {
+function createLangfuseBridgeService(getPluginConfig, bridgeState, conversationHooksEnabled) {
   /** @type {import("@opentelemetry/sdk-trace-node").NodeTracerProvider | null} */
   let provider = null;
   /** @type {import("@langfuse/otel").LangfuseSpanProcessor | null} */
@@ -64,14 +69,15 @@ function createLangfuseBridgeService(getPluginConfig) {
   let engine = null;
   /** @type {ReturnType<typeof setInterval> | null} */
   let reaper = null;
+  /** @type {ReturnType<typeof makeTranscriptResolvers> | null} */
+  let transcriptResolvers = null;
 
   return {
     id: "langfuse-bridge",
 
     async start(ctx) {
-      const { publicKey, secretKey, baseUrl } = resolveConfig(
-        getPluginConfig(),
-      );
+      const config = resolveConfig(getPluginConfig());
+      const { publicKey, secretKey, baseUrl } = config;
 
       if (!publicKey || !secretKey) {
         ctx.logger.warn(
@@ -96,18 +102,22 @@ function createLangfuseBridgeService(getPluginConfig) {
 
       const tracing = { startObservation };
 
-      // Prompt/response text and tool args/results are not delivered to
-      // third-party plugins (they're private data given only to bundled
-      // services), so we recover them best-effort from OpenClaw's per-session
-      // trajectory transcript under ctx.stateDir to populate observation IO.
-      const resolveContent = makeContentResolver(ctx.stateDir, ctx.logger);
-      const resolveToolIO = makeToolIOResolver(ctx.stateDir, ctx.logger);
+      // Hooks are authoritative. Session/trajectory parsing is a bounded,
+      // once-per-run fallback only when a hook did not provide a field.
+      transcriptResolvers = config.transcriptFallback
+        ? makeTranscriptResolvers(ctx.stateDir, ctx.logger)
+        : null;
 
       engine = createTraceEngine(tracing, {
         logger: ctx.logger,
-        resolveContent,
-        resolveToolIO,
+        resolveContent: transcriptResolvers?.resolveContent,
+        resolveToolIO: transcriptResolvers?.resolveToolIO,
+        conversationHooksEnabled,
+        captureConversationContent: config.captureConversationContent,
+        captureToolContent: config.captureToolContent,
+        maxContentBytes: config.maxContentBytes,
       });
+      bridgeState.engine = engine;
 
       // `onInternalDiagnosticEvent` invokes the listener as
       // (event, metadata) => void. We only need the event body; the engine
@@ -142,7 +152,10 @@ function createLangfuseBridgeService(getPluginConfig) {
       } catch {
         // best-effort flush of in-flight observations
       }
+      bridgeState.engine = null;
       engine = null;
+      transcriptResolvers?.clear();
+      transcriptResolvers = null;
       // Restore the default (global) provider for the Langfuse helpers.
       setLangfuseTracerProvider(null);
       if (spanProcessor) {
@@ -168,8 +181,47 @@ function createLangfuseBridgeService(getPluginConfig) {
 export default definePluginEntry({
   id: "langfuse-bridge",
   name: "Langfuse Bridge",
-  description: "Forwards OpenClaw model usage diagnostics to Langfuse",
+  description: "Correlates OpenClaw hooks and diagnostics in Langfuse",
   register(api) {
-    api.registerService(createLangfuseBridgeService(() => api.pluginConfig));
+    const config = resolveConfig(api.pluginConfig);
+    const bridgeState = { engine: null };
+    const conversationAllowed =
+      api.config?.plugins?.entries?.[api.id]?.hooks?.allowConversationAccess === true;
+    const conversationHooksEnabled =
+      config.captureConversationContent && conversationAllowed;
+
+    // Tool hooks are not conversation hooks and remain available even when raw
+    // conversation access was not granted.
+    for (const hookName of ["before_tool_call", "after_tool_call"]) {
+      api.on(hookName, (event, ctx) => {
+        bridgeState.engine?.handleHook(hookName, event, ctx);
+      });
+    }
+
+    if (conversationHooksEnabled) {
+      for (const hookName of [
+        "before_agent_run",
+        "llm_input",
+        "llm_output",
+        "before_agent_finalize",
+        "agent_end",
+      ]) {
+        api.on(hookName, (event, ctx) => {
+          bridgeState.engine?.handleHook(hookName, event, ctx);
+        });
+      }
+    } else if (config.captureConversationContent) {
+      api.logger.warn(
+        "langfuse-bridge: raw conversation hooks are disabled; set plugins.entries.langfuse-bridge.hooks.allowConversationAccess=true to capture agent/generation input and output (tool hooks remain active)",
+      );
+    }
+
+    api.registerService(
+      createLangfuseBridgeService(
+        () => api.pluginConfig,
+        bridgeState,
+        conversationHooksEnabled,
+      ),
+    );
   },
 });

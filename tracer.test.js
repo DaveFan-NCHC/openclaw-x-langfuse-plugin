@@ -277,3 +277,158 @@ test("unknown event types are ignored", () => {
   assert.equal(engine.handle(undefined), false);
   assert.equal(t.all.length, 0);
 });
+
+test("hooks remain authoritative after more than 64 session messages", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, {
+    conversationHooksEnabled: true,
+    resolveContent: () => ({ input: "stale trajectory prompt", output: "stale answer" }),
+    resolveToolIO: () => ({ tc65: { input: "stale args", output: "stale result" } }),
+  });
+  const ctx = {
+    runId: "r65",
+    sessionId: "s65",
+    channel: "webchat",
+    trace: { traceId: "T65" },
+  };
+  engine.handleHook(
+    "before_agent_run",
+    { prompt: "message 65", messages: Array.from({ length: 70 }, (_, i) => ({ role: "user", content: `m${i}` })) },
+    ctx,
+  );
+  engine.handleHook("before_tool_call", { toolName: "search", toolCallId: "tc65", params: { q: "fresh" } }, ctx);
+  engine.handle({ type: "tool.execution.completed", ts: 20, runId: "r65", toolName: "search", toolCallId: "tc65", trace: { traceId: "T65" } });
+  engine.handleHook("after_tool_call", { toolName: "search", toolCallId: "tc65", result: { hits: ["new"] } }, ctx);
+  engine.handleHook("llm_input", {
+    runId: "r65", sessionId: "s65", provider: "p", model: "m", prompt: "message 65",
+    historyMessages: Array.from({ length: 70 }, (_, i) => ({ role: "user", content: `m${i}` })), imagesCount: 0,
+  }, ctx);
+  engine.handleHook("llm_output", {
+    runId: "r65", sessionId: "s65", provider: "p", model: "m", assistantTexts: ["fresh answer"],
+  }, ctx);
+  engine.handle({ type: "model.usage", ts: 30, model: "m", usage: { input: 10, output: 2 }, trace: { traceId: "T65" } });
+  engine.handleHook("agent_end", { runId: "r65", success: true, messages: [{ role: "assistant", content: "fresh answer" }] }, ctx);
+  feed([]);
+
+  assert.deepEqual(t.roots()[0].traceIO, { input: "message 65", output: "fresh answer" });
+  const tool = t.byName("search");
+  assert.deepEqual(tool.attributes.input, { q: "fresh" });
+  assert.deepEqual(tool.attributes.output, { hits: ["new"] });
+  const generation = t.all.find((node) => node.opts.asType === "generation");
+  assert.equal(generation.attributes.input.historyMessages.length, 70);
+  assert.equal(generation.attributes.output, "fresh answer");
+});
+
+test("parallel tool hooks pair independently by toolCallId", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "rp", sessionId: "sp", trace: { traceId: "TP" } };
+  engine.handleHook("before_tool_call", { toolName: "search_a", toolCallId: "a", params: { q: "A" } }, ctx);
+  engine.handleHook("before_tool_call", { toolName: "search_b", toolCallId: "b", params: { q: "B" } }, ctx);
+  engine.handle({ type: "tool.execution.completed", ts: 20, runId: "rp", toolName: "search_b", toolCallId: "b", trace: { traceId: "TP" } });
+  engine.handle({ type: "tool.execution.completed", ts: 21, runId: "rp", toolName: "search_a", toolCallId: "a", trace: { traceId: "TP" } });
+  engine.handleHook("after_tool_call", { toolName: "search_b", toolCallId: "b", result: "result B" }, ctx);
+  engine.handleHook("after_tool_call", { toolName: "search_a", toolCallId: "a", result: "result A" }, ctx);
+
+  assert.equal(t.all.filter((node) => ["tool", "retriever"].includes(node.opts.asType)).length, 2);
+  assert.deepEqual(t.byName("search_a").attributes.input, { q: "A" });
+  assert.equal(t.byName("search_a").attributes.output, "result A");
+  assert.deepEqual(t.byName("search_b").attributes.input, { q: "B" });
+  assert.equal(t.byName("search_b").attributes.output, "result B");
+});
+
+test("late hooks enrich an existing diagnostic tool without duplication", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const diag = { runId: "rl", toolName: "edit", toolCallId: "late", trace: { traceId: "TL" } };
+  engine.handle({ type: "tool.execution.completed", ts: 20, durationMs: 5, ...diag });
+  engine.handle({ type: "tool.execution.started", ts: 15, ...diag });
+  engine.handleHook("before_tool_call", { toolName: "edit", toolCallId: "late", params: { path: "a.txt" } }, diag);
+  engine.handleHook("after_tool_call", { toolName: "edit", toolCallId: "late", result: "ok" }, diag);
+
+  const tools = t.all.filter((node) => node.opts.asType === "tool");
+  assert.equal(tools.length, 1);
+  assert.deepEqual(tools[0].attributes.input, { path: "a.txt" });
+  assert.equal(tools[0].attributes.output, "ok");
+  assert.equal(tools[0].ended, true);
+});
+
+test("blocked and failed tools are ERROR observations", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "re", sessionId: "se", trace: { traceId: "TE" } };
+  engine.handleHook("before_tool_call", { toolName: "bash", toolCallId: "failed", params: { command: "false" } }, ctx);
+  engine.handleHook("after_tool_call", { toolName: "bash", toolCallId: "failed", error: "exit 1", durationMs: 4 }, ctx);
+  engine.handle({ type: "tool.execution.blocked", ts: 10, runId: "re", toolName: "write", toolCallId: "blocked", deniedReason: "policy", trace: { traceId: "TE" } });
+  engine.handleHook("agent_end", { runId: "re", success: false, error: "blocked", messages: [] }, ctx);
+  feed([]);
+
+  assert.equal(t.byName("bash").attributes.level, "ERROR");
+  assert.equal(t.byName("write").attributes.level, "ERROR");
+  assert.equal(t.byName("write").ended, true);
+  assert.equal(t.roots()[0].attributes.level, "ERROR");
+});
+
+test("multiple llm hook pairs create separate generations", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "rm", sessionId: "sm", trace: { traceId: "TM" } };
+  for (const [prompt, answer, usage] of [
+    ["first", "tool plan", { input: 5, output: 2 }],
+    ["second", "final answer", { input: 8, output: 3 }],
+  ]) {
+    engine.handleHook("llm_input", { runId: "rm", sessionId: "sm", provider: "p", model: "m", prompt, historyMessages: [], imagesCount: 0 }, ctx);
+    engine.handleHook("llm_output", { runId: "rm", sessionId: "sm", provider: "p", model: "m", assistantTexts: [answer], usage }, ctx);
+  }
+  engine.handleHook("agent_end", { runId: "rm", success: true, messages: [{ role: "assistant", content: "final answer" }] }, ctx);
+  const generations = t.all.filter((node) => node.opts.asType === "generation");
+  assert.equal(generations.length, 2);
+  assert.equal(generations[0].ended, false, "agent_end defers close until usage can arrive");
+  engine.handle({ type: "model.usage", ts: 50, model: "m", usage: { input: 13, output: 5 }, costUsd: 0.1, trace: { traceId: "TM" } });
+  feed([]);
+
+  assert.equal(generations[0].attributes.input.prompt, "first");
+  assert.equal(generations[0].attributes.output, "tool plan");
+  assert.equal(generations[1].attributes.input.prompt, "second");
+  assert.equal(generations[1].attributes.output, "final answer");
+  assert.deepEqual(generations[0].attributes.usageDetails, { input: 5, output: 2 });
+  assert.deepEqual(generations[1].attributes.costDetails, { totalCost: 0.1 });
+  assert.ok(generations.every((generation) => generation.ended));
+});
+
+test("model.usage arriving before llm hooks does not create a duplicate generation", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "ro", sessionId: "so", trace: { traceId: "TO" } };
+  engine.handle({ type: "model.usage", ts: 20, model: "m", usage: { input: 2, output: 1 }, costUsd: 0.01, trace: { traceId: "TO" } });
+  engine.handleHook("llm_input", { runId: "ro", sessionId: "so", provider: "p", model: "m", prompt: "late input", historyMessages: [], imagesCount: 0 }, ctx);
+  engine.handleHook("llm_output", { runId: "ro", sessionId: "so", provider: "p", model: "m", assistantTexts: ["late output"] }, ctx);
+  engine.handleHook("agent_end", { runId: "ro", success: true, messages: [{ role: "assistant", content: "late output" }] }, ctx);
+  feed([]);
+
+  const generations = t.all.filter((node) => node.opts.asType === "generation");
+  assert.equal(generations.length, 1);
+  assert.equal(generations[0].attributes.input.prompt, "late input");
+  assert.equal(generations[0].attributes.output, "late output");
+  assert.deepEqual(generations[0].attributes.costDetails, { totalCost: 0.01 });
+});
+
+test("disabling conversation capture leaves conversation IO empty but tool hooks work", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, {
+    captureConversationContent: false,
+    captureToolContent: true,
+    resolveContent: () => ({ input: "must not leak", output: "must not leak" }),
+  });
+  const ctx = { runId: "rd", sessionId: "sd", trace: { traceId: "TD" } };
+  engine.handle({ type: "run.started", ts: 1, ...ctx });
+  engine.handleHook("before_tool_call", { toolName: "edit", toolCallId: "d", params: { value: 1 } }, ctx);
+  engine.handleHook("after_tool_call", { toolName: "edit", toolCallId: "d", result: "done" }, ctx);
+  engine.handle({ type: "model.usage", ts: 2, model: "m", usage: { input: 1, output: 1 }, ...ctx });
+  engine.handle({ type: "run.completed", ts: 3, ...ctx });
+  feed([]);
+
+  assert.equal(t.roots()[0].traceIO, undefined);
+  assert.equal(t.all.find((node) => node.opts.asType === "generation").attributes.input, undefined);
+  assert.deepEqual(t.byName("edit").attributes.input, { value: 1 });
+});

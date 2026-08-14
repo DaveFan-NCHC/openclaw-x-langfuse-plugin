@@ -1,7 +1,7 @@
 {
   "name": "openclaw-x-langfuse-plugin",
   "version": "1.5.0",
-  "description": "Forward OpenClaw model usage diagnostics to Langfuse",
+  "description": "Correlate OpenClaw hooks and diagnostics in Langfuse",
   "type": "module",
   "main": "index.js",
   "files": [
@@ -21,16 +21,16 @@
       "./index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.6.1"
+      "pluginApi": ">=2026.6.11"
     },
     "build": {
-      "openclawVersion": "2026.6.1"
+      "openclawVersion": "2026.6.11"
     },
     "install": {
       "clawhubSpec": "clawhub:openclaw-x-langfuse-plugin",
       "npmSpec": "openclaw-x-langfuse-plugin",
       "defaultChoice": "clawhub",
-      "minHostVersion": ">=2026.6.1"
+      "minHostVersion": ">=2026.6.11"
     },
     "release": {
       "publishToClawHub": true,

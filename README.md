@@ -1,6 +1,6 @@
 # openclaw-x-langfuse-plugin
 
-Forward [OpenClaw](https://openclaw.ai) model-usage diagnostics to
+Correlate [OpenClaw](https://openclaw.ai) hooks and diagnostics in
 [Langfuse](https://langfuse.com).
 
 The plugin registers a background service that subscribes to OpenClaw's internal
@@ -53,6 +53,9 @@ Enable the plugin and provide Langfuse credentials in `openclaw.json`:
     "entries": {
       "langfuse-bridge": {
         "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
         "config": {
           "publicKey": "pk-lf-...",
           "secretKey": "sk-lf-...",
@@ -73,6 +76,21 @@ when the corresponding config field is absent:
 | `secretKey`  | `LANGFUSE_SECRET_KEY`  | —                              |
 | `baseUrl`    | `LANGFUSE_BASE_URL`    | `https://cloud.langfuse.com`   |
 
+Raw agent/generation I/O is available only when
+`plugins.entries.langfuse-bridge.hooks.allowConversationAccess` is explicitly
+`true`. Without it, the plugin still starts and tool hooks still capture tool
+I/O; OpenClaw diagnostic events continue to provide trace structure, usage,
+cost, timing, and status.
+
+Content capture can be constrained independently:
+
+| Config field                  | Default | Effect |
+| ----------------------------- | ------- | ------ |
+| `captureConversationContent`  | `true`  | Capture agent and generation prompt/response content. |
+| `captureToolContent`          | `true`  | Capture tool arguments and results. |
+| `transcriptFallback`          | `true`  | Use bounded session JSONL, then legacy trajectory, only for missing hook fields. |
+| `maxContentBytes`             | `64000` | Maximum sanitized bytes per input/output field. |
+
 Then restart the gateway:
 
 ```bash
@@ -90,41 +108,47 @@ conversation's turns group in the Sessions view. Under that root:
 
 - **Turn root** (`agent`) — anchored by `run.started`/`run.completed`, with
   `outcome` and `durationMs`. Its trace-level input/output mirror the turn's
-  prompt and final response. (OpenClaw's per-event span parents are inconsistent
+  prompt from `before_agent_run` and final response from `agent_end` or
+  `before_agent_finalize`. (OpenClaw's per-event span parents are inconsistent
   — `model.usage` hangs off the harness span while tools hang off the run span —
   so children are attached directly to this one root rather than reconstructing
   that internal chain.)
-- **Generation** — built from `model.usage`: `model`, `usageDetails` (`input`,
-  `output`, `cache_read`, `cache_write`, `total`), `costDetails.totalCost` (USD),
-  timing, plus provider metadata and the turn's prompt/response text as
-  input/output.
+- **Generation** — one observation per `llm_input`/`llm_output` hook pair.
+  `model.usage` supplements it with `usageDetails`, aggregate turn usage,
+  `costDetails.totalCost` (USD), timing, and provider metadata; it does not
+  supply prompt/response content.
 - **Tool / Retriever** — one observation per `tool.execution.*`, named after the
   tool. Retrieval/search tools (vector search, RAG, grep, web fetch, memory
   recall, …) are classified as Langfuse `retriever` observations; everything else
   is a `tool`. Carries `toolSource`, `paramsSummary`, duration, and — when
-  recoverable — the tool's arguments and result as input/output.
+  recoverable — arguments from `before_tool_call` and result/error from
+  `after_tool_call` as input/output. Calls are paired by `toolCallId`, including
+  parallel and out-of-order delivery.
 - **Context** — `context.assembled` becomes a short span with message/prompt
   size metadata.
 - **Errors** — `model.call.error` becomes an ERROR observation with the failure
   category/kind.
 
-Message content (prompts, responses, tool arguments and results) is **not**
-delivered to third-party plugins — OpenClaw hands it only to bundled diagnostics
-services. The bridge recovers it best-effort from the per-session trajectory
-transcript
-(`<stateDir>/agents/<agentId>/sessions/<sessionId>.trajectory.jsonl`). If the
-transcript is unavailable, observations are still forwarded with empty
-input/output; the structure (which step ran, when, how long) is always present.
+Raw hook content is sanitized before export: credential/token/header fields are
+redacted, images/base64/binary are omitted, and each input/output is size
+bounded. Hook handlers never log full content or mutate OpenClaw payloads.
+
+If a hook field is unavailable, the bridge can parse the canonical per-session
+`<sessionId>.jsonl` transcript once per run, then consult the legacy trajectory
+as a final fallback. The trajectory `messagesSnapshot` is not considered a
+complete conversation because OpenClaw truncates arrays to 64 entries. If no
+content is available, the observation is still forwarded with empty I/O.
 
 ### Robustness
 
-OpenClaw delivers `tool.execution.*` and `model.call.*` events asynchronously
+OpenClaw delivers hooks and `tool.execution.*` events asynchronously
 (they're queued and can be dropped under heavy load), while `run.*` and
 `model.usage` are synchronous — so `run.completed` reaches the bridge *before*
 its own tool events, and `model.usage` arrives *after* it. The engine handles
-this by soft-ending the turn root (fixing its duration) while keeping it
-resolvable, so late-arriving children still attach to it, and an idle reaper
-closes any observation orphaned by a dropped terminal event.
+this with `traceId`, `runId`, `toolCallId`, `sessionId`, and `sessionKey`
+indexes. A terminal event received before its start/hook enriches the same
+observation rather than creating a duplicate, and an idle reaper closes any
+observation orphaned by a dropped terminal event.
 
 ## How it works
 
@@ -134,6 +158,13 @@ import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import { startObservation, setLangfuseTracerProvider } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
+
+let engine;
+api.on("before_tool_call", (event, ctx) =>
+  engine?.handleHook("before_tool_call", event, ctx));
+api.on("after_tool_call", (event, ctx) =>
+  engine?.handleHook("after_tool_call", event, ctx));
+// Conversation hooks are registered the same way when access is allowed.
 
 api.registerService({
   id: "langfuse-bridge",
@@ -147,16 +178,12 @@ api.registerService({
     // The engine groups observations into one trace per turn, keyed by the W3C
     // trace id OpenClaw stamps on every event, and attaches model.usage /
     // tool.execution.* / context.assembled as children of that turn root.
-    const engine = createTraceEngine({ startObservation }, { /* resolvers */ });
+    engine = createTraceEngine({ startObservation }, { /* resolvers */ });
     const unsubscribe = onInternalDiagnosticEvent((evt) => engine.handle(evt));
     setInterval(() => engine.sweep(), 60_000).unref(); // reap orphans
   },
 });
 ```
-
-> Note: these events are emitted on OpenClaw's reply/delivery path (channel
-> messages, webchat/TUI turns) — not on direct `openclaw agent` CLI runs, which
-> use the embedded runner and don't emit them.
 
 ## License
 

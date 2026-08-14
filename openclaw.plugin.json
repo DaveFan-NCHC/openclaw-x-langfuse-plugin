@@ -1,7 +1,7 @@
 {
   "id": "langfuse-bridge",
   "name": "Langfuse Bridge",
-  "description": "Forwards OpenClaw model usage diagnostics to Langfuse",
+  "description": "Correlates OpenClaw hooks and diagnostics in Langfuse",
   "activation": {
     "onStartup": true
   },
@@ -20,6 +20,28 @@
       "baseUrl": {
         "type": "string",
         "description": "Langfuse host. Falls back to LANGFUSE_BASE_URL, then https://cloud.langfuse.com."
+      },
+      "captureConversationContent": {
+        "type": "boolean",
+        "default": true,
+        "description": "Capture prompt/response content from conversation hooks. Requires hooks.allowConversationAccess=true."
+      },
+      "captureToolContent": {
+        "type": "boolean",
+        "default": true,
+        "description": "Capture tool params/results from before_tool_call and after_tool_call."
+      },
+      "transcriptFallback": {
+        "type": "boolean",
+        "default": true,
+        "description": "Use bounded session JSONL and legacy trajectory parsing when hook content is unavailable."
+      },
+      "maxContentBytes": {
+        "type": "integer",
+        "minimum": 256,
+        "maximum": 1000000,
+        "default": 64000,
+        "description": "Maximum sanitized bytes sent for any captured input or output field."
       }
     }
   }

@@ -8,6 +8,8 @@ import {
   toolAttributes,
   contextSummary,
   errorAttributes,
+  sanitizeContent,
+  lastAssistantText,
 } from "./mapping.js";
 import { extractContent, extractToolIO, trajectoryPath } from "./transcript.js";
 
@@ -82,6 +84,39 @@ test("errorAttributes sets ERROR level + status from category/kind/denied", () =
   assert.equal(errorAttributes({ errorCategory: "timeout" }).level, "ERROR");
   assert.equal(errorAttributes({ errorCategory: "timeout" }).statusMessage, "timeout");
   assert.equal(errorAttributes({ deniedReason: "policy" }).statusMessage, "policy");
+});
+
+test("sanitizeContent redacts credentials, omits images/binary, and does not mutate", () => {
+  const original = {
+    token: "super-secret-token",
+    headers: { Authorization: "Bearer abcdefghijklmnop" },
+    prompt: "use api_key=abcdefghijklmnop",
+    image: `data:image/png;base64,${"A".repeat(1024)}`,
+    bytes: Buffer.from("secret bytes"),
+  };
+  const sanitized = sanitizeContent(original, 10_000);
+  assert.equal(sanitized.token, "[REDACTED]");
+  assert.equal(sanitized.headers.Authorization, "[REDACTED]");
+  assert.match(sanitized.prompt, /\[REDACTED\]/);
+  assert.equal(sanitized.image, "[OMITTED_IMAGE]");
+  assert.match(sanitized.bytes, /OMITTED_BINARY/);
+  assert.equal(original.token, "super-secret-token");
+});
+
+test("sanitizeContent enforces the configured byte bound", () => {
+  const sanitized = sanitizeContent("long content: ".repeat(1000), 512);
+  assert.ok(Buffer.byteLength(sanitized, "utf8") <= 512);
+  assert.match(sanitized, /TRUNCATED/);
+});
+
+test("lastAssistantText ignores tool-only blocks and unwraps message rows", () => {
+  assert.equal(
+    lastAssistantText([
+      { role: "assistant", content: [{ type: "toolCall", id: "x" }] },
+      { message: { role: "assistant", content: [{ type: "text", text: "answer" }] } },
+    ]),
+    "answer",
+  );
 });
 
 test("extractContent reads the last model.completed turn", () => {
