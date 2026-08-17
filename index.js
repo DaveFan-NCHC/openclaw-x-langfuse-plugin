@@ -32,6 +32,12 @@ import {
 } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
 import { makeTranscriptResolvers } from "./transcript.js";
+import {
+  dispatchBridgeHook,
+  ownsBridgeEngine,
+  publishBridgeEngine,
+  releaseBridgeEngine,
+} from "./bridge-runtime-state.js";
 
 const DEFAULT_BASE_URL = "https://cloud.langfuse.com";
 
@@ -58,7 +64,10 @@ function resolveConfig(pluginConfig) {
   };
 }
 
-function createLangfuseBridgeService(getPluginConfig, bridgeState, conversationHooksEnabled) {
+function createLangfuseBridgeService(getPluginConfig, conversationHooksEnabled) {
+  // A unique token prevents an older service instance from clearing a newer
+  // engine when Gateway plugin reload lifecycles overlap.
+  const owner = Symbol("langfuse-bridge-service");
   /** @type {import("@opentelemetry/sdk-trace-node").NodeTracerProvider | null} */
   let provider = null;
   /** @type {import("@langfuse/otel").LangfuseSpanProcessor | null} */
@@ -117,18 +126,22 @@ function createLangfuseBridgeService(getPluginConfig, bridgeState, conversationH
         captureToolContent: config.captureToolContent,
         maxContentBytes: config.maxContentBytes,
       });
-      bridgeState.engine = engine;
+      publishBridgeEngine(owner, engine);
 
       // `onInternalDiagnosticEvent` invokes the listener as
       // (event, metadata) => void. We only need the event body; the engine
       // ignores unrelated event types and catches its own errors, so it never
       // throws into the bus.
-      unsubscribe = onInternalDiagnosticEvent((evt) => engine?.handle(evt));
+      unsubscribe = onInternalDiagnosticEvent((evt) => {
+        if (ownsBridgeEngine(owner)) engine?.handle(evt);
+      });
 
       // Idle reaper: ends observations orphaned by dropped start/complete events
       // (these event types are async-queued and droppable under load). Unref'd
       // so it never keeps the process alive.
-      reaper = setInterval(() => engine?.sweep(), REAPER_INTERVAL_MS);
+      reaper = setInterval(() => {
+        if (ownsBridgeEngine(owner)) engine?.sweep();
+      }, REAPER_INTERVAL_MS);
       reaper.unref?.();
 
       ctx.logger.info(
@@ -152,12 +165,12 @@ function createLangfuseBridgeService(getPluginConfig, bridgeState, conversationH
       } catch {
         // best-effort flush of in-flight observations
       }
-      bridgeState.engine = null;
+      const releasedCurrentEngine = releaseBridgeEngine(owner);
       engine = null;
       transcriptResolvers?.clear();
       transcriptResolvers = null;
       // Restore the default (global) provider for the Langfuse helpers.
-      setLangfuseTracerProvider(null);
+      if (releasedCurrentEngine) setLangfuseTracerProvider(null);
       if (spanProcessor) {
         try {
           await spanProcessor.forceFlush();
@@ -184,7 +197,6 @@ export default definePluginEntry({
   description: "Correlates OpenClaw hooks and diagnostics in Langfuse",
   register(api) {
     const config = resolveConfig(api.pluginConfig);
-    const bridgeState = { engine: null };
     const conversationAllowed =
       api.config?.plugins?.entries?.[api.id]?.hooks?.allowConversationAccess === true;
     const conversationHooksEnabled =
@@ -194,7 +206,7 @@ export default definePluginEntry({
     // conversation access was not granted.
     for (const hookName of ["before_tool_call", "after_tool_call"]) {
       api.on(hookName, (event, ctx) => {
-        bridgeState.engine?.handleHook(hookName, event, ctx);
+        dispatchBridgeHook(hookName, event, ctx);
       });
     }
 
@@ -207,7 +219,7 @@ export default definePluginEntry({
         "agent_end",
       ]) {
         api.on(hookName, (event, ctx) => {
-          bridgeState.engine?.handleHook(hookName, event, ctx);
+          dispatchBridgeHook(hookName, event, ctx);
         });
       }
     } else if (config.captureConversationContent) {
@@ -217,11 +229,7 @@ export default definePluginEntry({
     }
 
     api.registerService(
-      createLangfuseBridgeService(
-        () => api.pluginConfig,
-        bridgeState,
-        conversationHooksEnabled,
-      ),
+      createLangfuseBridgeService(() => api.pluginConfig, conversationHooksEnabled),
     );
   },
 });

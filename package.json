@@ -6,6 +6,7 @@
   "main": "index.js",
   "files": [
     "index.js",
+    "bridge-runtime-state.js",
     "mapping.js",
     "tracer.js",
     "transcript.js",
