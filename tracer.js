@@ -930,10 +930,6 @@ export function createTraceEngine(tracing, opts = {}) {
       // best-effort
     }
     finishGeneration(entry);
-    const finalText = Array.isArray(evt.assistantTexts)
-      ? evt.assistantTexts.filter((text) => typeof text === "string" && text.trim()).at(-1)
-      : undefined;
-    if (finalText) updateRootIO(root, { output: finalText }, true);
   }
 
   function onBeforeAgentFinalize(evt) {
@@ -952,7 +948,9 @@ export function createTraceEngine(tracing, opts = {}) {
     let output;
     if (captureConversationContent && evt.success !== false && !root.outputSet) {
       const messages = Array.isArray(evt.messages) ? evt.messages : [];
-      const currentTurnMessages = Number.isInteger(root.agentStartMessageCount)
+      const currentTurnMessages =
+        Number.isInteger(root.agentStartMessageCount) &&
+        messages.length >= root.agentStartMessageCount
         ? messages.slice(root.agentStartMessageCount)
         : messages;
       output = lastAssistantText(currentTurnMessages);

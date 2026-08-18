@@ -651,7 +651,7 @@ test("failed agent_end does not reuse an assistant response from an earlier turn
   assert.equal(root.attributes.level, "ERROR");
 });
 
-test("successful no-answer agent_end does not reuse fallback output from an earlier turn", () => {
+test("delegation llm output stays on its generation and does not become root output", () => {
   const t = fakeTracing();
   const { engine, feed } = makeEngine(t, {
     conversationHooksEnabled: true,
@@ -661,6 +661,11 @@ test("successful no-answer agent_end does not reuse fallback output from an earl
   const history = [{ role: "assistant", content: "old answer" }];
 
   engine.handleHook("before_agent_run", { prompt: "delegate this", messages: history }, ctx);
+  engine.handleHook(
+    "llm_output",
+    { model: "m", assistantTexts: ["task passed to subagent"] },
+    ctx,
+  );
   // Usage commonly races ahead of agent_end and must not commit stale fallback I/O.
   engine.handle({
     type: "model.usage",
@@ -678,6 +683,8 @@ test("successful no-answer agent_end does not reuse fallback output from an earl
   assert.equal(root.attributes.output, undefined);
   assert.equal(root.attributes.metadata.noAnswer, true);
   assert.equal(root.ended, true);
+  const generation = t.all.find((node) => node.opts.asType === "generation");
+  assert.equal(generation.attributes.output, "task passed to subagent");
 });
 
 test("missing agent_end still permits root output fallback", () => {
@@ -1025,6 +1032,11 @@ test("parallel subagents sharing a trace keep separate generations and answers",
     engine.handleHook(
       "llm_output",
       { model: "m", assistantTexts: [`answer ${suffix}`] },
+      childCtx,
+    );
+    engine.handleHook(
+      "agent_end",
+      { success: true, messages: [{ role: "assistant", content: `answer ${suffix}` }] },
       childCtx,
     );
   }
