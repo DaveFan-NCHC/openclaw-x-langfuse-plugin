@@ -661,6 +661,25 @@ test("delegation llm output stays on its generation and does not become root out
   const history = [{ role: "assistant", content: "old answer" }];
 
   engine.handleHook("before_agent_run", { prompt: "delegate this", messages: history }, ctx);
+  engine.handle({
+    type: "tool.execution.started",
+    ts: 2,
+    toolName: "sessions_spawn",
+    toolCallId: "spawn-1",
+    ...ctx,
+  });
+  engine.handleHook(
+    "before_tool_call",
+    { toolName: "sessions_spawn", toolCallId: "spawn-1", params: { task: "task passed to subagent" } },
+    ctx,
+  );
+  engine.handle({
+    type: "tool.execution.completed",
+    ts: 7,
+    toolName: "sessions_spawn",
+    toolCallId: "spawn-1",
+    ...ctx,
+  });
   engine.handleHook(
     "llm_output",
     { model: "m", assistantTexts: ["task passed to subagent"] },
@@ -685,6 +704,26 @@ test("delegation llm output stays on its generation and does not become root out
   assert.equal(root.ended, true);
   const generation = t.all.find((node) => node.opts.asType === "generation");
   assert.equal(generation.attributes.output, "task passed to subagent");
+});
+
+test("a normal final llm output becomes root output when finalization hooks are late", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = { runId: "r-late-final", sessionId: "s-late-final", trace: { traceId: "T-LATE-FINAL" } };
+
+  engine.handleHook("before_agent_run", { prompt: "question", messages: [] }, ctx);
+  engine.handleHook(
+    "llm_output",
+    { model: "m", assistantTexts: ["final answer"] },
+    ctx,
+  );
+  engine.handle({ type: "run.completed", ts: 10, outcome: "completed", ...ctx });
+  feed([]);
+
+  assert.deepEqual(t.roots()[0].traceIO, {
+    input: "question",
+    output: "final answer",
+  });
 });
 
 test("missing agent_end still permits root output fallback", () => {

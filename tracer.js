@@ -334,6 +334,8 @@ export function createTraceEngine(tracing, opts = {}) {
       runCompleted: false,
       agentEnded: false,
       conversationOutputResolved: false,
+      llmOutputCandidate: undefined,
+      delegatedToSubagent: false,
       finalizeScheduled: false,
       inputSet: false,
       outputSet: false,
@@ -495,6 +497,9 @@ export function createTraceEngine(tracing, opts = {}) {
       }
     }
     if (entry) {
+      if (entry.root && evt?.toolName === "sessions_spawn") {
+        entry.root.delegatedToSubagent = true;
+      }
       if (key) {
         entry.toolKeys.add(key);
         toolsByKey.set(key, entry);
@@ -502,6 +507,9 @@ export function createTraceEngine(tracing, opts = {}) {
       return touch(entry);
     }
     const root = ensureRoot(evt);
+    if (root && evt?.toolName === "sessions_spawn") {
+      root.delegatedToSubagent = true;
+    }
     const asType = classifyToolType(evt?.toolName);
     entry = createChild(evt, root, {
       name: evt?.toolName ?? asType,
@@ -599,6 +607,16 @@ export function createTraceEngine(tracing, opts = {}) {
 
   function finalizeTrace(root) {
     if (!root || root.ended) return;
+    // llm_output is reliable enough to retain as a late-finalization fallback,
+    // but it can describe the handoff text of a sessions_spawn run. Promote it
+    // only after the run has been classified as a normal, non-delegating turn.
+    if (
+      !root.outputSet &&
+      root.llmOutputCandidate !== undefined &&
+      !root.delegatedToSubagent
+    ) {
+      updateRootIO(root, { output: root.llmOutputCandidate });
+    }
     if (!root.inputSet || (!root.outputSet && !root.conversationOutputResolved)) {
       updateRootIO(root, unresolvedRootFallback(root));
     }
@@ -782,6 +800,10 @@ export function createTraceEngine(tracing, opts = {}) {
       (evt.runId && subagentsByRun.get(evt.runId)) ||
       (childSessionKey && subagentsBySession.get(childSessionKey));
     const parentRoot = findRootBySession(evt.requesterSessionKey, evt.runId);
+    if (parentRoot) {
+      parentRoot.delegatedToSubagent = true;
+      touch(parentRoot);
+    }
     const info = {
       ...existing,
       runId: evt.runId ?? existing?.runId,
@@ -930,6 +952,10 @@ export function createTraceEngine(tracing, opts = {}) {
       // best-effort
     }
     finishGeneration(entry);
+    const finalText = Array.isArray(evt.assistantTexts)
+      ? evt.assistantTexts.filter((text) => typeof text === "string" && text.trim()).at(-1)
+      : messageText(evt.lastAssistant);
+    if (root && finalText) root.llmOutputCandidate = clean(finalText);
   }
 
   function onBeforeAgentFinalize(evt) {
