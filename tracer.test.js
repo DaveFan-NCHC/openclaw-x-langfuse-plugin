@@ -714,3 +714,381 @@ test("disabling conversation capture leaves conversation IO empty but tool hooks
   assert.equal(t.all.find((node) => node.opts.asType === "generation").attributes.input, undefined);
   assert.deepEqual(t.byName("edit").attributes.input, { value: 1 });
 });
+
+test("different runs sharing one trace keep independent agent I/O", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const mainCtx = {
+    runId: "run-main",
+    sessionId: "session-main",
+    sessionKey: "agent:main:main",
+    trace: { traceId: "TRACE-SHARED", spanId: "MAIN-HARNESS" },
+  };
+  const childCtx = {
+    runId: "run-child",
+    sessionId: "session-child",
+    sessionKey: "agent:main:subagent:child",
+    trace: { traceId: "TRACE-SHARED", spanId: "CHILD-HARNESS" },
+  };
+
+  engine.handleHook("before_agent_run", { prompt: "original user question", messages: [] }, mainCtx);
+  engine.handleHook("before_agent_run", { prompt: "delegated child task", messages: [] }, childCtx);
+  engine.handleHook(
+    "agent_end",
+    { success: true, messages: [{ role: "assistant", content: "child answer" }] },
+    childCtx,
+  );
+  engine.handleHook(
+    "agent_end",
+    { success: true, messages: [{ role: "assistant", content: "main answer" }] },
+    mainCtx,
+  );
+
+  const agents = t.all.filter((node) => node.opts.asType === "agent");
+  assert.equal(agents.length, 2);
+  assert.deepEqual(agents.map((node) => node.traceIO), [
+    { input: "original user question", output: "main answer" },
+    { input: "delegated child task", output: "child answer" },
+  ]);
+});
+
+test("repeated before_agent_run for one run preserves its initial user input", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const ctx = {
+    runId: "run-repeated-input",
+    sessionId: "session-repeated-input",
+    trace: { traceId: "TRACE-REPEATED-INPUT" },
+  };
+
+  engine.handleHook("before_agent_run", { prompt: "original user input", messages: [] }, ctx);
+  engine.handleHook(
+    "before_agent_run",
+    { prompt: "internal continuation input", messages: [] },
+    ctx,
+  );
+
+  assert.deepEqual(t.roots()[0].traceIO, { input: "original user input" });
+});
+
+test("a child run completion cannot finalize another run sharing its trace", () => {
+  const t = fakeTracing();
+  const { engine, flushDeferred } = makeEngine(t, { conversationHooksEnabled: true });
+  const main = {
+    runId: "run-parent",
+    sessionId: "session-parent",
+    trace: { traceId: "TRACE-LIFECYCLE", spanId: "PARENT-RUN" },
+  };
+  const child = {
+    runId: "run-child",
+    sessionId: "session-child",
+    trace: { traceId: "TRACE-LIFECYCLE", spanId: "CHILD-RUN" },
+  };
+
+  engine.handle({ type: "run.started", ts: 1, ...main });
+  engine.handle({ type: "run.started", ts: 2, ...child });
+  engine.handle({ type: "run.completed", ts: 3, outcome: "completed", ...child });
+  flushDeferred();
+
+  const [parentAgent, childAgent] = t.all.filter((node) => node.opts.asType === "agent");
+  assert.equal(parentAgent.ended, false);
+  assert.equal(childAgent.ended, true);
+  assert.equal(childAgent.endCalls, 1);
+
+  engine.handle({ type: "run.completed", ts: 4, outcome: "completed", ...main });
+  flushDeferred();
+  assert.equal(parentAgent.ended, true);
+  assert.equal(parentAgent.endCalls, 1);
+});
+
+test("subagent lifecycle links child I/O without changing parent trace I/O", () => {
+  const t = fakeTracing();
+  const { engine, flushDeferred } = makeEngine(t, { conversationHooksEnabled: true });
+  const parentCtx = {
+    runId: "run-parent-linked",
+    sessionId: "session-parent-linked",
+    sessionKey: "agent:main:parent",
+    trace: { traceId: "TRACE-LINKED", spanId: "PARENT-HARNESS" },
+  };
+  const childCtx = {
+    runId: "run-child-linked",
+    sessionId: "session-child-linked",
+    sessionKey: "agent:main:subagent:linked",
+    trace: { traceId: "TRACE-LINKED", spanId: "CHILD-HARNESS" },
+  };
+
+  engine.handleHook("before_agent_run", { prompt: "user request", messages: [] }, parentCtx);
+  engine.handleHook(
+    "subagent_spawned",
+    {
+      runId: childCtx.runId,
+      childSessionKey: childCtx.sessionKey,
+      agentId: "main",
+      label: "research",
+      mode: "run",
+    },
+    { requesterSessionKey: parentCtx.sessionKey },
+  );
+  engine.handleHook("before_agent_run", { prompt: "research this", messages: [] }, childCtx);
+  engine.handleHook(
+    "agent_end",
+    { success: true, messages: [{ role: "assistant", content: "research result" }] },
+    childCtx,
+  );
+  engine.handleHook(
+    "subagent_ended",
+    {
+      runId: childCtx.runId,
+      targetSessionKey: childCtx.sessionKey,
+      reason: "subagent-complete",
+      outcome: "ok",
+    },
+    {},
+  );
+  engine.handle({ type: "run.completed", ts: 20, outcome: "completed", ...childCtx });
+  flushDeferred();
+
+  const parent = t.roots()[0];
+  const child = parent.children.find((node) => node.opts.asType === "agent");
+  assert.ok(child);
+  assert.equal(child.attributes.metadata.subagent, true);
+  assert.equal(child.attributes.metadata.parentRunId, parentCtx.runId);
+  assert.equal(child.attributes.input, "research this");
+  assert.equal(child.attributes.output, "research result");
+  assert.deepEqual(parent.traceIO, { input: "user request" });
+  assert.equal(parent.ended, false);
+  assert.equal(child.ended, true);
+});
+
+test("late subagent_spawned enriches an existing child without duplication", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const parentCtx = {
+    runId: "run-parent-late",
+    sessionKey: "agent:main:late-parent",
+    trace: { traceId: "TRACE-LATE-SUBAGENT", spanId: "PARENT" },
+  };
+  const childCtx = {
+    runId: "run-child-late",
+    sessionKey: "agent:main:subagent:late",
+    trace: { traceId: "TRACE-LATE-SUBAGENT", spanId: "CHILD" },
+  };
+
+  engine.handleHook("before_agent_run", { prompt: "user input", messages: [] }, parentCtx);
+  engine.handleHook("before_agent_run", { prompt: "late child task", messages: [] }, childCtx);
+  engine.handleHook(
+    "subagent_spawned",
+    {
+      runId: childCtx.runId,
+      childSessionKey: childCtx.sessionKey,
+      agentId: "main",
+      label: "late",
+      mode: "run",
+    },
+    { requesterSessionKey: parentCtx.sessionKey },
+  );
+
+  const agents = t.all.filter((node) => node.opts.asType === "agent");
+  assert.equal(agents.length, 2);
+  assert.equal(agents[0].traceIO.input, "user input");
+  assert.equal(agents[1].traceIO.input, "late child task");
+  assert.equal(agents[1].attributes.metadata.subagent, true);
+  assert.equal(agents[1].attributes.metadata.parentRunId, parentCtx.runId);
+});
+
+test("subagent failure marks only the child observation as ERROR", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const parentCtx = {
+    runId: "run-error-parent",
+    sessionKey: "agent:main:error-parent",
+    trace: { traceId: "TRACE-SUBAGENT-ERROR", spanId: "PARENT" },
+  };
+  const childCtx = {
+    runId: "run-error-child",
+    sessionKey: "agent:main:subagent:error",
+    trace: { traceId: "TRACE-SUBAGENT-ERROR", spanId: "CHILD" },
+  };
+  engine.handleHook("before_agent_run", { prompt: "user input", messages: [] }, parentCtx);
+  engine.handleHook(
+    "subagent_spawned",
+    {
+      runId: childCtx.runId,
+      childSessionKey: childCtx.sessionKey,
+      agentId: "main",
+      mode: "run",
+    },
+    { requesterSessionKey: parentCtx.sessionKey },
+  );
+  engine.handleHook("before_agent_run", { prompt: "failing child task", messages: [] }, childCtx);
+  engine.handleHook(
+    "subagent_ended",
+    {
+      runId: childCtx.runId,
+      targetSessionKey: childCtx.sessionKey,
+      reason: "subagent-error",
+      outcome: "error",
+      error: "child failed",
+    },
+    {},
+  );
+
+  const parent = t.roots()[0];
+  const child = parent.children.find((node) => node.opts.asType === "agent");
+  assert.equal(parent.attributes.level, undefined);
+  assert.equal(child.attributes.level, "ERROR");
+  assert.equal(child.attributes.statusMessage, "child failed");
+  assert.equal(child.attributes.metadata.subagentOutcome, "error");
+});
+
+test("parallel subagents sharing a trace keep separate generations and answers", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const parentCtx = {
+    runId: "run-parallel-parent",
+    sessionKey: "agent:main:parallel-parent",
+    trace: { traceId: "TRACE-PARALLEL-AGENTS", spanId: "PARENT" },
+  };
+  engine.handleHook("before_agent_run", { prompt: "compare two sources", messages: [] }, parentCtx);
+
+  for (const suffix of ["a", "b"]) {
+    const childCtx = {
+      runId: `run-parallel-${suffix}`,
+      sessionId: `session-parallel-${suffix}`,
+      sessionKey: `agent:main:subagent:${suffix}`,
+      trace: { traceId: "TRACE-PARALLEL-AGENTS", spanId: `CHILD-${suffix}` },
+    };
+    engine.handleHook(
+      "subagent_spawned",
+      {
+        runId: childCtx.runId,
+        childSessionKey: childCtx.sessionKey,
+        agentId: "main",
+        label: suffix,
+        mode: "run",
+      },
+      { requesterSessionKey: parentCtx.sessionKey },
+    );
+    engine.handleHook("before_agent_run", { prompt: `task ${suffix}`, messages: [] }, childCtx);
+    engine.handleHook(
+      "llm_input",
+      { model: "m", prompt: `task ${suffix}`, historyMessages: [] },
+      childCtx,
+    );
+    engine.handleHook(
+      "llm_output",
+      { model: "m", assistantTexts: [`answer ${suffix}`] },
+      childCtx,
+    );
+  }
+
+  const childAgents = t.all.filter(
+    (node) => node.opts.asType === "agent" && node.attributes.metadata.subagent,
+  );
+  assert.equal(childAgents.length, 2);
+  assert.deepEqual(childAgents.map((node) => node.attributes.input), ["task a", "task b"]);
+  assert.deepEqual(childAgents.map((node) => node.attributes.output), ["answer a", "answer b"]);
+  assert.deepEqual(
+    childAgents.map((node) => node.children.filter((child) => child.opts.asType === "generation").length),
+    [1, 1],
+  );
+  assert.deepEqual(t.roots()[0].traceIO, { input: "compare two sources" });
+});
+
+test("trace-only usage selects the matching run and stays standalone when ambiguous", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const mainCtx = {
+    runId: "run-usage-main",
+    sessionId: "session-usage-main",
+    trace: { traceId: "TRACE-USAGE-MULTI", spanId: "MAIN-HARNESS" },
+  };
+  const childCtx = {
+    runId: "run-usage-child",
+    sessionId: "session-usage-child",
+    trace: { traceId: "TRACE-USAGE-MULTI", spanId: "CHILD-HARNESS" },
+  };
+  engine.handle({
+    type: "run.started",
+    ts: 1,
+    ...mainCtx,
+    trace: { traceId: "TRACE-USAGE-MULTI", spanId: "MAIN-RUN", parentSpanId: "MAIN-HARNESS" },
+  });
+  engine.handle({
+    type: "run.started",
+    ts: 2,
+    ...childCtx,
+    trace: { traceId: "TRACE-USAGE-MULTI", spanId: "CHILD-RUN", parentSpanId: "CHILD-HARNESS" },
+  });
+  engine.handleHook("llm_input", { model: "m", prompt: "main", historyMessages: [] }, mainCtx);
+  engine.handleHook("llm_output", { model: "m", assistantTexts: ["main answer"] }, mainCtx);
+  engine.handleHook("llm_input", { model: "m", prompt: "child", historyMessages: [] }, childCtx);
+  engine.handleHook("llm_output", { model: "m", assistantTexts: ["child answer"] }, childCtx);
+
+  engine.handle({
+    type: "model.usage",
+    ts: 10,
+    model: "m",
+    usage: { input: 11, output: 1 },
+    trace: { traceId: "TRACE-USAGE-MULTI", spanId: "MAIN-USAGE", parentSpanId: "MAIN-HARNESS" },
+  });
+  engine.handle({
+    type: "model.usage",
+    ts: 11,
+    model: "m",
+    usage: { input: 22, output: 2 },
+    trace: { traceId: "TRACE-USAGE-MULTI", spanId: "CHILD-USAGE", parentSpanId: "CHILD-HARNESS" },
+  });
+  engine.handle({
+    type: "model.usage",
+    ts: 12,
+    model: "ambiguous",
+    usage: { input: 99, output: 9 },
+    trace: { traceId: "TRACE-USAGE-MULTI", spanId: "UNKNOWN" },
+  });
+
+  const mainGeneration = t.all.find(
+    (node) => node.opts.asType === "generation" && node.attributes.input?.prompt === "main",
+  );
+  const childGeneration = t.all.find(
+    (node) => node.opts.asType === "generation" && node.attributes.input?.prompt === "child",
+  );
+  assert.deepEqual(mainGeneration.attributes.usageDetails, { input: 11, output: 1 });
+  assert.deepEqual(childGeneration.attributes.usageDetails, { input: 22, output: 2 });
+  const standalone = t.roots().find(
+    (node) => node.opts.asType === "generation" && node.name === "ambiguous",
+  );
+  assert.ok(standalone);
+  assert.deepEqual(standalone.attributes.usageDetails, { input: 99, output: 9 });
+});
+
+test("trace-only usage with a different session cannot contaminate the lone known run", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, { conversationHooksEnabled: true });
+  const mainCtx = {
+    runId: "run-known-session",
+    sessionId: "session-known",
+    trace: { traceId: "TRACE-SESSION-MISMATCH", spanId: "KNOWN" },
+  };
+  engine.handleHook("llm_input", { model: "m", prompt: "known input", historyMessages: [] }, mainCtx);
+  engine.handleHook("llm_output", { model: "m", assistantTexts: ["known output"] }, mainCtx);
+
+  engine.handle({
+    type: "model.usage",
+    ts: 10,
+    sessionId: "session-other",
+    model: "other-session-model",
+    usage: { input: 7, output: 3 },
+    trace: { traceId: "TRACE-SESSION-MISMATCH", spanId: "OTHER" },
+  });
+
+  const knownGeneration = t.all.find(
+    (node) => node.opts.asType === "generation" && node.attributes.input?.prompt === "known input",
+  );
+  assert.equal(knownGeneration.attributes.usageDetails, undefined);
+  const standalone = t.roots().find(
+    (node) => node.opts.asType === "generation" && node.name === "other-session-model",
+  );
+  assert.ok(standalone);
+  assert.deepEqual(standalone.attributes.usageDetails, { input: 7, output: 3 });
+});

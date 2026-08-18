@@ -82,6 +82,8 @@ export function createTraceEngine(tracing, opts = {}) {
   const rootsByRun = new Map();
   const toolsByKey = new Map();
   const generationsByRun = new Map();
+  const subagentsByRun = new Map();
+  const subagentsBySession = new Map();
 
   function clean(value) {
     return sanitizeContent(value, maxContentBytes);
@@ -100,13 +102,16 @@ export function createTraceEngine(tracing, opts = {}) {
 
   function forget(entry) {
     live.delete(entry);
-    if (entry.traceId && rootsByTrace.get(entry.traceId) === entry) {
-      rootsByTrace.delete(entry.traceId);
+    for (const traceId of entry.traceIds ?? []) {
+      const roots = rootsByTrace.get(traceId);
+      roots?.delete(entry);
+      if (roots?.size === 0) rootsByTrace.delete(traceId);
     }
     if (entry.runId && rootsByRun.get(entry.runId) === entry) rootsByRun.delete(entry.runId);
     for (const key of entry.toolKeys ?? []) {
       if (toolsByKey.get(key) === entry) toolsByKey.delete(key);
     }
+    entry.parentRoot?.children.delete(entry);
   }
 
   function endEntry(entry, endTimeMs, keep = false) {
@@ -134,11 +139,101 @@ export function createTraceEngine(tracing, opts = {}) {
     else endEntry(oldest, now());
   }
 
-  function refreshRoot(root, evt) {
+  function addTraceRoot(traceId, root) {
+    if (!traceId) return;
+    let roots = rootsByTrace.get(traceId);
+    if (!roots) {
+      roots = new Set();
+      rootsByTrace.set(traceId, roots);
+    }
+    roots.add(root);
+    root.traceIds.add(traceId);
+  }
+
+  function recordTraceContext(root, evt) {
     const tid = traceIdOf(evt);
-    if (tid && !root.traceId) {
-      root.traceId = tid;
-      rootsByTrace.set(tid, root);
+    if (tid) {
+      root.traceId ??= tid;
+      addTraceRoot(tid, root);
+    }
+    if (evt?.trace?.spanId) root.traceSpanIds.add(evt.trace.spanId);
+    if (evt?.trace?.parentSpanId) root.traceParentSpanIds.add(evt.trace.parentSpanId);
+  }
+
+  function rootMatchesSession(root, evt) {
+    const eventIds = [evt?.sessionId, evt?.sessionKey].filter(Boolean);
+    if (eventIds.length === 0) return false;
+    const rootIds = [root.ctx.sessionId, root.ctx.sessionKey].filter(Boolean);
+    return eventIds.some((id) => rootIds.includes(id));
+  }
+
+  function rootMatchesTraceContext(root, evt) {
+    const spanId = evt?.trace?.spanId;
+    const parentSpanId = evt?.trace?.parentSpanId;
+    return Boolean(
+      (spanId &&
+        (root.traceSpanIds.has(spanId) || root.traceParentSpanIds.has(spanId))) ||
+        (parentSpanId &&
+          (root.traceSpanIds.has(parentSpanId) ||
+            root.traceParentSpanIds.has(parentSpanId))),
+    );
+  }
+
+  function traceCandidates(traceId) {
+    return [...(rootsByTrace.get(traceId) ?? [])].filter((root) => live.has(root));
+  }
+
+  function resolveTraceOnlyRoot(evt) {
+    const tid = traceIdOf(evt);
+    if (!tid) return null;
+    const candidates = traceCandidates(tid);
+    if (candidates.length === 0) return null;
+
+    const sessionMatches = candidates.filter((root) => rootMatchesSession(root, evt));
+    if (sessionMatches.length === 1) return sessionMatches[0];
+    let scoped = sessionMatches.length > 1 ? sessionMatches : candidates;
+    if (sessionOf(evt) && sessionMatches.length === 0) {
+      // A known, different session is evidence of another run, not permission
+      // to attach to the only root currently observed for this trace.
+      scoped = candidates.filter((root) => !sessionOf(root.ctx));
+      if (scoped.length === 0) return null;
+    }
+
+    const traceMatches = scoped.filter((root) => rootMatchesTraceContext(root, evt));
+    if (traceMatches.length === 1) return traceMatches[0];
+    if (scoped.length === 1) return scoped[0];
+    return null;
+  }
+
+  function findRootBySession(sessionKey, excludeRunId) {
+    if (!sessionKey) return null;
+    const candidates = [...new Set(rootsByRun.values())]
+      .filter(
+        (root) =>
+          root.runId !== excludeRunId &&
+          (root.ctx.sessionKey === sessionKey || root.ctx.sessionId === sessionKey),
+      )
+      .sort((a, b) => Number(a.ended) - Number(b.ended) || b.lastMs - a.lastMs);
+    return candidates[0] ?? null;
+  }
+
+  function subagentInfoFor(evt) {
+    return (
+      (evt?.runId && subagentsByRun.get(evt.runId)) ||
+      (evt?.sessionKey && subagentsBySession.get(evt.sessionKey)) ||
+      (evt?.sessionId && subagentsBySession.get(evt.sessionId)) ||
+      (evt?.childSessionKey && subagentsBySession.get(evt.childSessionKey)) ||
+      (evt?.targetSessionKey && subagentsBySession.get(evt.targetSessionKey))
+    );
+  }
+
+  function refreshRoot(root, evt) {
+    recordTraceContext(root, evt);
+    if (evt?.runId && root.runId && evt.runId !== root.runId) {
+      logger?.warn?.(
+        `langfuse-bridge: refused to merge run ${evt.runId} into ${root.runId}`,
+      );
+      return;
     }
     if (evt?.runId && !root.runId) {
       root.runId = evt.runId;
@@ -150,14 +245,14 @@ export function createTraceEngine(tracing, opts = {}) {
       root.named = true;
       try {
         root.obs.update({ name: evt.channel });
-        setTraceFields(root.obs, evt.channel, undefined);
+        if (!root.parentRoot) setTraceFields(root.obs, evt.channel, undefined);
       } catch {
         // best-effort
       }
     }
     if (!root.sessioned && sessionOf(evt)) {
       root.sessioned = true;
-      setTraceFields(root.obs, undefined, sessionOf(evt));
+      if (!root.parentRoot) setTraceFields(root.obs, undefined, sessionOf(evt));
     }
     root.ctx.sessionId ??= evt?.sessionId;
     root.ctx.sessionKey ??= evt?.sessionKey;
@@ -167,27 +262,63 @@ export function createTraceEngine(tracing, opts = {}) {
     touch(root);
   }
 
-  function ensureRoot(evt) {
+  function ensureRoot(evt, preferredParent) {
     const tid = traceIdOf(evt);
     const runId = evt?.runId;
-    let root = (tid && rootsByTrace.get(tid)) || (runId && rootsByRun.get(runId));
+    const existingTraceCandidates = !runId && tid ? traceCandidates(tid) : [];
+    let root = runId ? rootsByRun.get(runId) : resolveTraceOnlyRoot(evt);
     if (root) {
       refreshRoot(root, evt);
       return root;
     }
+    if (!runId && existingTraceCandidates.length > 0) {
+      // The trace contains multiple runs and this event lacks enough identity
+      // to select one. Returning no root is safer than inventing an agent root
+      // that future trace-only events could incorrectly adopt.
+      return null;
+    }
+
+    // A trace-only diagnostic can arrive before the first event carrying its
+    // runId. Adopt only an unassigned, unambiguous root; never merge two known
+    // runs merely because OpenClaw propagated the same W3C traceId.
+    if (runId && tid) {
+      const adoptable = traceCandidates(tid).filter(
+        (candidate) =>
+          !candidate.runId &&
+          (!sessionOf(evt) ||
+            !sessionOf(candidate.ctx) ||
+            rootMatchesSession(candidate, evt)),
+      );
+      if (adoptable.length === 1) {
+        root = adoptable[0];
+        refreshRoot(root, evt);
+        return root;
+      }
+    }
     if (!tid && !runId) return null;
 
+    const subagent = subagentInfoFor(evt);
+    const mappedParent =
+      preferredParent ??
+      (subagent?.parentRunId && rootsByRun.get(subagent.parentRunId)) ??
+      findRootBySession(subagent?.requesterSessionKey, runId);
+    const parentRoot =
+      mappedParent && !mappedParent.ended ? mappedParent : undefined;
+
     const name = evt?.channel ?? "openclaw run";
-    const obs = tracing.startObservation(
-      name,
-      runAttributes(evt),
-      compact({ asType: "agent", startTime: toDate(evt?.ts) }),
-    );
-    setTraceFields(obs, name, sessionOf(evt));
+    const observationOptions = compact({ asType: "agent", startTime: toDate(evt?.ts) });
+    const obs = parentRoot
+      ? parentRoot.obs.startObservation(name, runAttributes(evt), observationOptions)
+      : tracing.startObservation(name, runAttributes(evt), observationOptions);
+    if (!parentRoot) setTraceFields(obs, name, sessionOf(evt));
     root = register({
       obs,
       kind: "root",
+      parentRoot,
       traceId: tid,
+      traceIds: new Set(),
+      traceSpanIds: new Set(),
+      traceParentSpanIds: new Set(),
       runId,
       named: Boolean(evt?.channel),
       sessioned: Boolean(sessionOf(evt)),
@@ -209,11 +340,13 @@ export function createTraceEngine(tracing, opts = {}) {
       lastMs: now(),
       ended: false,
     });
-    if (tid) rootsByTrace.set(tid, root);
+    recordTraceContext(root, evt);
+    parentRoot?.children.add(root);
     if (runId) {
       rootsByRun.set(runId, root);
       generationsByRun.set(runId, root.generations);
     }
+    if (subagent) updateSubagentMetadata(root, subagent);
     return root;
   }
 
@@ -243,6 +376,27 @@ export function createTraceEngine(tracing, opts = {}) {
     };
   }
 
+  function updateSubagentMetadata(root, info) {
+    if (!root || !info) return;
+    root.subagent = info;
+    try {
+      root.obs.update({
+        metadata: compact({
+          subagent: true,
+          childSessionKey: info.childSessionKey,
+          requesterSessionKey: info.requesterSessionKey,
+          parentRunId: info.parentRunId,
+          label: info.label,
+          mode: info.mode,
+          subagentOutcome: info.outcome,
+          subagentReason: info.reason,
+        }),
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
   function updateRootIO(root, io, overwrite = false) {
     if (!root || !io) return;
     const patch = {};
@@ -259,7 +413,9 @@ export function createTraceEngine(tracing, opts = {}) {
     if (Object.keys(patch).length === 0) return;
     try {
       root.obs.update(patch);
-      root.obs.setTraceIO?.({ ...root.traceIO });
+      // Nested subagent observations own their observation I/O, but must not
+      // rewrite the Langfuse trace-level I/O owned by the initiating root.
+      if (!root.parentRoot) root.obs.setTraceIO?.({ ...root.traceIO });
     } catch {
       // best-effort
     }
@@ -590,13 +746,94 @@ export function createTraceEngine(tracing, opts = {}) {
     );
   }
 
+  function rememberSubagent(info) {
+    if (!info) return;
+    info.lastMs = now();
+    if (info.runId) subagentsByRun.set(info.runId, info);
+    if (info.childSessionKey) subagentsBySession.set(info.childSessionKey, info);
+  }
+
+  function onSubagentSpawned(evt) {
+    const childSessionKey = evt.childSessionKey ?? evt.sessionKey;
+    const existing =
+      (evt.runId && subagentsByRun.get(evt.runId)) ||
+      (childSessionKey && subagentsBySession.get(childSessionKey));
+    const parentRoot = findRootBySession(evt.requesterSessionKey, evt.runId);
+    const info = {
+      ...existing,
+      runId: evt.runId ?? existing?.runId,
+      childSessionKey: childSessionKey ?? existing?.childSessionKey,
+      requesterSessionKey: evt.requesterSessionKey ?? existing?.requesterSessionKey,
+      parentRunId: parentRoot?.runId ?? existing?.parentRunId,
+      agentId: evt.agentId ?? existing?.agentId,
+      label: evt.label ?? existing?.label,
+      mode: evt.mode ?? existing?.mode,
+      resolvedModel: evt.resolvedModel ?? existing?.resolvedModel,
+      resolvedProvider: evt.resolvedProvider ?? existing?.resolvedProvider,
+    };
+    rememberSubagent(info);
+
+    // Do not synthesize the child observation here. Its first agent/diagnostic
+    // event owns the real start time and can use the relationship just stored.
+    // If that event raced ahead, enrich the already-created observation.
+    const root =
+      (info.runId && rootsByRun.get(info.runId)) ||
+      findRootBySession(info.childSessionKey);
+    updateSubagentMetadata(root, info);
+  }
+
+  function onSubagentEnded(evt) {
+    const childSessionKey = evt.targetSessionKey ?? evt.childSessionKey ?? evt.sessionKey;
+    const existing =
+      (evt.runId && subagentsByRun.get(evt.runId)) ||
+      (childSessionKey && subagentsBySession.get(childSessionKey));
+    const parentRoot = findRootBySession(existing?.requesterSessionKey, evt.runId);
+    const info = {
+      ...existing,
+      runId: evt.runId ?? existing?.runId,
+      childSessionKey: childSessionKey ?? existing?.childSessionKey,
+      parentRunId: existing?.parentRunId ?? parentRoot?.runId,
+      outcome: evt.outcome ?? existing?.outcome,
+      reason: evt.reason ?? existing?.reason,
+      error: evt.error ?? existing?.error,
+      ended: true,
+      endedAt: evt.endedAt ?? existing?.endedAt,
+    };
+    rememberSubagent(info);
+
+    const root =
+      (info.runId && rootsByRun.get(info.runId)) ||
+      findRootBySession(info.childSessionKey) ||
+      ensureRoot(
+        {
+          ...evt,
+          runId: info.runId,
+          sessionKey: info.childSessionKey,
+        },
+        parentRoot,
+      );
+    updateSubagentMetadata(root, info);
+    if (root && (info.outcome === "error" || info.outcome === "timeout" || info.error)) {
+      try {
+        root.obs.update({
+          level: "ERROR",
+          statusMessage: info.error ? clean(info.error) : info.outcome,
+        });
+      } catch {
+        // best-effort
+      }
+    }
+    // The child run's diagnostic run.completed remains authoritative for its
+    // observation end time. subagent_ended contributes relationship/status only.
+  }
+
   // Typed hook handlers ------------------------------------------------------
 
   function onBeforeAgentRun(evt) {
     const root = ensureRoot(evt);
     if (!root || !captureConversationContent) return;
     root.agentStartMessageCount = Array.isArray(evt.messages) ? evt.messages.length : undefined;
-    updateRootIO(root, { input: evt.prompt }, true);
+    updateRootIO(root, { input: evt.prompt });
     try {
       root.obs.update({
         metadata: compact({
@@ -808,6 +1045,12 @@ export function createTraceEngine(tracing, opts = {}) {
     const evt = mergeHookEvent(event, ctx, now);
     try {
       switch (name) {
+        case "subagent_spawned":
+          onSubagentSpawned(evt);
+          return true;
+        case "subagent_ended":
+          onSubagentEnded(evt);
+          return true;
         case "before_agent_run":
           onBeforeAgentRun(evt);
           return true;
@@ -855,6 +1098,22 @@ export function createTraceEngine(tracing, opts = {}) {
       if (retained.length > 0) generationsByRun.set(runId, retained);
       else generationsByRun.delete(runId);
     }
+    for (const info of new Set([
+      ...subagentsByRun.values(),
+      ...subagentsBySession.values(),
+    ])) {
+      const childRoot = info.runId ? rootsByRun.get(info.runId) : undefined;
+      if (info.lastMs >= cutoff || (childRoot && !childRoot.ended)) continue;
+      if (info.runId && subagentsByRun.get(info.runId) === info) {
+        subagentsByRun.delete(info.runId);
+      }
+      if (
+        info.childSessionKey &&
+        subagentsBySession.get(info.childSessionKey) === info
+      ) {
+        subagentsBySession.delete(info.childSessionKey);
+      }
+    }
   }
 
   function flushAll() {
@@ -867,6 +1126,8 @@ export function createTraceEngine(tracing, opts = {}) {
       else endEntry(entry, entry.completedMs ?? time);
     }
     generationsByRun.clear();
+    subagentsByRun.clear();
+    subagentsBySession.clear();
   }
 
   return { handle, handleHook, sweep, flushAll };

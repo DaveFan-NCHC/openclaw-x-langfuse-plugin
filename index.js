@@ -202,9 +202,14 @@ export default definePluginEntry({
     const conversationHooksEnabled =
       config.captureConversationContent && conversationAllowed;
 
-    // Tool hooks are not conversation hooks and remain available even when raw
-    // conversation access was not granted.
-    for (const hookName of ["before_tool_call", "after_tool_call"]) {
+    // Tool and subagent lifecycle hooks do not expose raw conversation content
+    // and remain available even when conversation access was not granted.
+    for (const hookName of [
+      "before_tool_call",
+      "after_tool_call",
+      "subagent_spawned",
+      "subagent_ended",
+    ]) {
       api.on(hookName, (event, ctx) => {
         dispatchBridgeHook(hookName, event, ctx);
       });
@@ -224,7 +229,7 @@ export default definePluginEntry({
       }
     } else if (config.captureConversationContent) {
       api.logger.warn(
-        "langfuse-bridge: raw conversation hooks are disabled; set plugins.entries.langfuse-bridge.hooks.allowConversationAccess=true to capture agent/generation input and output (tool hooks remain active)",
+        "langfuse-bridge: raw conversation hooks are disabled; set plugins.entries.langfuse-bridge.hooks.allowConversationAccess=true to capture agent/generation input and output (tool and subagent lifecycle hooks remain active)",
       );
     }
 

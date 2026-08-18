@@ -78,9 +78,9 @@ when the corresponding config field is absent:
 
 Raw agent/generation I/O is available only when
 `plugins.entries.langfuse-bridge.hooks.allowConversationAccess` is explicitly
-`true`. Without it, the plugin still starts and tool hooks still capture tool
-I/O; OpenClaw diagnostic events continue to provide trace structure, usage,
-cost, timing, and status.
+`true`. Without it, the plugin still starts, tool hooks still capture tool I/O,
+and subagent lifecycle relationships remain available; OpenClaw diagnostic
+events continue to provide trace structure, usage, cost, timing, and status.
 
 Content capture can be constrained independently:
 
@@ -102,9 +102,12 @@ start — it never blocks the gateway.
 
 ## What gets sent
 
-Each OpenClaw turn becomes one Langfuse trace (keyed by the shared W3C trace id),
-named after the channel, with `session.id` set to the OpenClaw session id so a
-conversation's turns group in the Sessions view. Under that root:
+Each OpenClaw run becomes an `agent` observation, named after the channel, with
+`session.id` set to the OpenClaw session id so a conversation's turns group in
+the Sessions view. `runId` is the observation identity; a shared W3C `traceId`
+is correlation context and may contain a main run, continuations, and multiple
+subagent runs. Different runs are never collapsed merely because they share a
+trace id.
 
 - **Turn root** (`agent`) — anchored by `run.started`/`run.completed`, with
   `outcome` and `durationMs`. Its trace-level input/output mirror the turn's
@@ -113,6 +116,12 @@ conversation's turns group in the Sessions view. Under that root:
   — `model.usage` hangs off the harness span while tools hang off the run span —
   so children are attached directly to this one root rather than reconstructing
   that internal chain.)
+- **Subagent** (`agent`) — correlated from `subagent_spawned`/`subagent_ended`
+  by child `runId` and `childSessionKey`. Its delegated task and final answer
+  come from the child's own conversation hooks. When the parent observation is
+  still open, the child is nested beneath it; otherwise it remains an
+  independently correct observation with requester/parent metadata. A child
+  never rewrites the initiating trace's input/output.
 - **Generation** — one observation per `llm_input`/`llm_output` hook pair.
   `model.usage` supplements it with `usageDetails`, aggregate turn usage,
   `costDetails.totalCost` (USD), timing, and provider metadata; it does not
@@ -148,7 +157,9 @@ its own tool events, and `model.usage` arrives *after* it. The engine handles
 this with `traceId`, `runId`, `toolCallId`, `sessionId`, and `sessionKey`
 indexes. A terminal event received before its start/hook enriches the same
 observation rather than creating a duplicate, and an idle reaper closes any
-observation orphaned by a dropped terminal event.
+observation orphaned by a dropped terminal event. Trace-only usage events are
+attached only when session/span context identifies one run unambiguously;
+ambiguous usage remains standalone instead of contaminating another run.
 
 ## How it works
 
@@ -164,6 +175,10 @@ api.on("before_tool_call", (event, ctx) =>
   engine?.handleHook("before_tool_call", event, ctx));
 api.on("after_tool_call", (event, ctx) =>
   engine?.handleHook("after_tool_call", event, ctx));
+api.on("subagent_spawned", (event, ctx) =>
+  engine?.handleHook("subagent_spawned", event, ctx));
+api.on("subagent_ended", (event, ctx) =>
+  engine?.handleHook("subagent_ended", event, ctx));
 // Conversation hooks are registered the same way when access is allowed.
 
 api.registerService({
