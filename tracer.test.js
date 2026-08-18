@@ -651,6 +651,53 @@ test("failed agent_end does not reuse an assistant response from an earlier turn
   assert.equal(root.attributes.level, "ERROR");
 });
 
+test("successful no-answer agent_end does not reuse fallback output from an earlier turn", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, {
+    conversationHooksEnabled: true,
+    resolveContent: () => ({ input: "old question", output: "old answer" }),
+  });
+  const ctx = { runId: "r-no-answer", sessionId: "s-no-answer", trace: { traceId: "T-NO-ANSWER" } };
+  const history = [{ role: "assistant", content: "old answer" }];
+
+  engine.handleHook("before_agent_run", { prompt: "delegate this", messages: history }, ctx);
+  // Usage commonly races ahead of agent_end and must not commit stale fallback I/O.
+  engine.handle({
+    type: "model.usage",
+    ts: 8,
+    model: "m",
+    usage: { input: 2, output: 0 },
+    ...ctx,
+  });
+  engine.handle({ type: "run.completed", ts: 10, outcome: "completed", ...ctx });
+  engine.handleHook("agent_end", { success: true, messages: history }, ctx);
+  feed([]);
+
+  const root = t.roots()[0];
+  assert.deepEqual(root.traceIO, { input: "delegate this" });
+  assert.equal(root.attributes.output, undefined);
+  assert.equal(root.attributes.metadata.noAnswer, true);
+  assert.equal(root.ended, true);
+});
+
+test("missing agent_end still permits root output fallback", () => {
+  const t = fakeTracing();
+  const { engine, feed } = makeEngine(t, {
+    conversationHooksEnabled: true,
+    resolveContent: () => ({ input: "fallback input", output: "fallback answer" }),
+  });
+  const ctx = { runId: "r-missing-end", sessionId: "s-missing-end", trace: { traceId: "T-MISSING-END" } };
+
+  engine.handleHook("before_agent_run", { prompt: "hook input", messages: [] }, ctx);
+  engine.handle({ type: "run.completed", ts: 10, outcome: "completed", ...ctx });
+  feed([]);
+
+  assert.deepEqual(t.roots()[0].traceIO, {
+    input: "hook input",
+    output: "fallback answer",
+  });
+});
+
 test("multiple llm hook pairs create separate generations", () => {
   const t = fakeTracing();
   const { engine, feed } = makeEngine(t, { conversationHooksEnabled: true });

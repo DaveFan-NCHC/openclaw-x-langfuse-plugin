@@ -333,6 +333,7 @@ export function createTraceEngine(tracing, opts = {}) {
       generations: [],
       runCompleted: false,
       agentEnded: false,
+      conversationOutputResolved: false,
       finalizeScheduled: false,
       inputSet: false,
       outputSet: false,
@@ -432,6 +433,21 @@ export function createTraceEngine(tracing, opts = {}) {
     } catch {
       return undefined;
     }
+  }
+
+  function unresolvedRootFallback(root) {
+    const content = fallbackContent(root);
+    if (!content) return undefined;
+    return compact({
+      input: !root.inputSet ? content.input : undefined,
+      // An agent_end hook with no current-turn assistant message is an
+      // authoritative no-answer result. Session/trajectory fallbacks are not
+      // turn-bounded and could otherwise reuse an older assistant response.
+      output:
+        !root.outputSet && !root.conversationOutputResolved
+          ? content.output
+          : undefined,
+    });
   }
 
   function fallbackToolIO(root, toolCallId) {
@@ -583,7 +599,9 @@ export function createTraceEngine(tracing, opts = {}) {
 
   function finalizeTrace(root) {
     if (!root || root.ended) return;
-    if (!root.inputSet || !root.outputSet) updateRootIO(root, fallbackContent(root));
+    if (!root.inputSet || (!root.outputSet && !root.conversationOutputResolved)) {
+      updateRootIO(root, unresolvedRootFallback(root));
+    }
     finishRootChildren(root);
     endEntry(root, root.endMs ?? now(), true);
   }
@@ -620,8 +638,13 @@ export function createTraceEngine(tracing, opts = {}) {
     let content;
     if (!entry) {
       const expectsHookIO = conversationHooksEnabled && Boolean(root || evt?.runId);
-      if (root) content = fallbackContent(root);
-      else if (captureConversationContent) {
+      // When raw hooks are enabled, model.usage can arrive before agent_end.
+      // Do not let a session-wide fallback commit an older turn's output in
+      // that window; root finalization will apply fallback only if completion
+      // hooks never resolve the output.
+      if (root) {
+        if (!expectsHookIO) content = unresolvedRootFallback(root);
+      } else if (captureConversationContent) {
         try {
           content = resolveContent?.(evt);
         } catch {
@@ -935,6 +958,7 @@ export function createTraceEngine(tracing, opts = {}) {
       output = lastAssistantText(currentTurnMessages);
     }
     if (output) updateRootIO(root, { output }, true);
+    if (captureConversationContent) root.conversationOutputResolved = true;
     try {
       root.obs.update({
         ...(evt.success === false ? { level: "ERROR", statusMessage: clean(evt.error) } : {}),
