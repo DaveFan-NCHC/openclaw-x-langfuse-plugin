@@ -15,7 +15,6 @@ import {
   errorAttributes,
   sanitizeContent,
   lastAssistantText,
-  messageText,
 } from "./mapping.js";
 
 const DEFAULT_TTL_MS = 5 * 60_000;
@@ -55,7 +54,6 @@ function outputFromLlmEvent(evt) {
   if (Array.isArray(evt?.assistantTexts) && evt.assistantTexts.length > 0) {
     return evt.assistantTexts.length === 1 ? evt.assistantTexts[0] : evt.assistantTexts;
   }
-  return messageText(evt?.lastAssistant);
 }
 
 /**
@@ -65,8 +63,6 @@ function outputFromLlmEvent(evt) {
 export function createTraceEngine(tracing, opts = {}) {
   const {
     logger,
-    resolveContent,
-    resolveToolIO,
     now = () => Date.now(),
     ttlMs = DEFAULT_TTL_MS,
     maxEntries = DEFAULT_MAX_ENTRIES,
@@ -332,8 +328,6 @@ export function createTraceEngine(tracing, opts = {}) {
       children: new Set(),
       generations: [],
       runCompleted: false,
-      agentEnded: false,
-      conversationOutputResolved: false,
       llmOutputCandidate: undefined,
       delegatedToSubagent: false,
       finalizeScheduled: false,
@@ -370,13 +364,6 @@ export function createTraceEngine(tracing, opts = {}) {
     });
     root?.children.add(entry);
     return entry;
-  }
-
-  function probe(root) {
-    return {
-      ...root.ctx,
-      trace: root.ctx.trace ?? (root.traceId ? { traceId: root.traceId } : undefined),
-    };
   }
 
   function updateSubagentMetadata(root, info) {
@@ -424,57 +411,17 @@ export function createTraceEngine(tracing, opts = {}) {
     }
   }
 
-  function fallbackContent(root) {
-    if (
-      !captureConversationContent ||
-      !root ||
-      typeof resolveContent !== "function"
-    ) return undefined;
-    try {
-      return resolveContent(probe(root));
-    } catch {
-      return undefined;
-    }
-  }
-
-  function unresolvedRootFallback(root) {
-    const content = fallbackContent(root);
-    if (!content) return undefined;
-    return compact({
-      input: !root.inputSet ? content.input : undefined,
-      // An agent_end hook with no current-turn assistant message is an
-      // authoritative no-answer result. Session/trajectory fallbacks are not
-      // turn-bounded and could otherwise reuse an older assistant response.
-      output:
-        !root.outputSet && !root.conversationOutputResolved
-          ? content.output
-          : undefined,
-    });
-  }
-
-  function fallbackToolIO(root, toolCallId) {
-    if (!toolCallId || typeof resolveToolIO !== "function") return undefined;
-    try {
-      return resolveToolIO(root ? probe(root) : {})?.[toolCallId];
-    } catch {
-      return undefined;
-    }
-  }
-
-  function applyToolIO(entry, io, overwrite = false) {
+  function applyToolIO(entry, io) {
     if (!entry || !io) return;
     const patch = {};
-    if (captureToolContent && io.input !== undefined && (overwrite || !entry.inputSet)) {
+    if (captureToolContent && io.input !== undefined) {
       patch.input = clean(io.input);
-      entry.inputSet = true;
     }
-    if (captureToolContent && io.output !== undefined && (overwrite || !entry.outputSet)) {
+    if (captureToolContent && io.output !== undefined) {
       patch.output = clean(io.output);
-      entry.outputSet = true;
     }
     if (io.isError) {
       patch.level = "ERROR";
-      entry.isError = true;
     }
     if (Object.keys(patch).length === 0) return;
     try {
@@ -522,8 +469,6 @@ export function createTraceEngine(tracing, opts = {}) {
     });
     entry.toolCallId = evt?.toolCallId;
     entry.toolKeys = new Set();
-    entry.inputSet = false;
-    entry.outputSet = false;
     if (key) {
       entry.toolKeys.add(key);
       toolsByKey.set(key, entry);
@@ -561,7 +506,6 @@ export function createTraceEngine(tracing, opts = {}) {
     entry.outputEventReceived = attributes.output !== undefined;
     entry.diagnosticCompleted = false;
     const list = generationList(evt?.runId, root);
-    entry.sequence = list.length + 1;
     list.push(entry);
     return entry;
   }
@@ -576,9 +520,8 @@ export function createTraceEngine(tracing, opts = {}) {
     if (!entry || entry.ended || !entry.diagnosticTerminal) return;
     // Async diagnostics normally preserve started -> terminal ordering, but a
     // delayed/dropped start must not let a terminal hook close the span before
-    // a late started event can enrich it. run.completed is the bounded fallback.
+    // a late started event can enrich it. run.completed bounds the wait.
     if (!entry.diagnosticStarted && root && !root.runCompleted) return;
-    applyToolIO(entry, fallbackToolIO(root, entry.toolCallId));
     endEntry(entry, entry.completedMs ?? now(), true);
   }
 
@@ -607,18 +550,13 @@ export function createTraceEngine(tracing, opts = {}) {
 
   function finalizeTrace(root) {
     if (!root || root.ended) return;
-    // llm_output is reliable enough to retain as a late-finalization fallback,
-    // but it can describe the handoff text of a sessions_spawn run. Promote it
-    // only after the run has been classified as a normal, non-delegating turn.
+    // A sessions_spawn run's LLM text describes the handoff, not a user reply.
     if (
       !root.outputSet &&
       root.llmOutputCandidate !== undefined &&
       !root.delegatedToSubagent
     ) {
       updateRootIO(root, { output: root.llmOutputCandidate });
-    }
-    if (!root.inputSet || (!root.outputSet && !root.conversationOutputResolved)) {
-      updateRootIO(root, unresolvedRootFallback(root));
     }
     finishRootChildren(root);
     endEntry(root, root.endMs ?? now(), true);
@@ -653,28 +591,12 @@ export function createTraceEngine(tracing, opts = {}) {
     const root = ensureRoot(evt);
     const candidates = root ? generationList(root.runId, root) : generationList(evt?.runId);
     let entry = candidates.findLast((candidate) => !candidate.ended);
-    let content;
     if (!entry) {
       const expectsHookIO = conversationHooksEnabled && Boolean(root || evt?.runId);
-      // When raw hooks are enabled, model.usage can arrive before agent_end.
-      // Do not let a session-wide fallback commit an older turn's output in
-      // that window; root finalization will apply fallback only if completion
-      // hooks never resolve the output.
-      if (root) {
-        if (!expectsHookIO) content = unresolvedRootFallback(root);
-      } else if (captureConversationContent) {
-        try {
-          content = resolveContent?.(evt);
-        } catch {
-          content = undefined;
-        }
-      }
       entry = createGeneration(
         evt,
         root,
-        expectsHookIO
-          ? {}
-          : compact({ input: content?.input, output: content?.output }),
+        {},
         typeof evt.durationMs === "number" ? evt.ts - evt.durationMs : evt.ts,
       );
       entry.syntheticUsage = expectsHookIO;
@@ -703,12 +625,6 @@ export function createTraceEngine(tracing, opts = {}) {
       );
     } catch {
       // best-effort
-    }
-
-    if (root) updateRootIO(root, content);
-    else {
-      const io = compact({ input: content?.input, output: content?.output });
-      if (Object.keys(io).length > 0) entry.obs.setTraceIO?.(io);
     }
 
     const turnGenerations = candidates.length > 0 ? candidates : [entry];
@@ -748,7 +664,6 @@ export function createTraceEngine(tracing, opts = {}) {
     const isError = evt.type === "tool.execution.error" || evt.type === "tool.execution.blocked";
     entry.completedMs = evt.ts;
     entry.diagnosticTerminal = true;
-    entry.isError ||= isError;
     try {
       entry.obs.update(
         compact({
@@ -954,7 +869,7 @@ export function createTraceEngine(tracing, opts = {}) {
     finishGeneration(entry);
     const finalText = Array.isArray(evt.assistantTexts)
       ? evt.assistantTexts.filter((text) => typeof text === "string" && text.trim()).at(-1)
-      : messageText(evt.lastAssistant);
+      : undefined;
     if (root && finalText) root.llmOutputCandidate = clean(finalText);
   }
 
@@ -970,7 +885,6 @@ export function createTraceEngine(tracing, opts = {}) {
   function onAgentEnd(evt) {
     const root = ensureRoot(evt);
     if (!root) return;
-    root.agentEnded = true;
     let output;
     if (captureConversationContent && evt.success !== false && !root.outputSet) {
       const messages = Array.isArray(evt.messages) ? evt.messages : [];
@@ -982,7 +896,6 @@ export function createTraceEngine(tracing, opts = {}) {
       output = lastAssistantText(currentTurnMessages);
     }
     if (output) updateRootIO(root, { output }, true);
-    if (captureConversationContent) root.conversationOutputResolved = true;
     try {
       root.obs.update({
         ...(evt.success === false ? { level: "ERROR", statusMessage: clean(evt.error) } : {}),
@@ -1004,7 +917,7 @@ export function createTraceEngine(tracing, opts = {}) {
   function onBeforeToolCall(evt) {
     const entry = ensureTool(evt, "hook-before");
     entry.hookStarted = true;
-    if (captureToolContent) applyToolIO(entry, { input: evt.params }, true);
+    applyToolIO(entry, { input: evt.params });
     try {
       entry.obs.update({
         metadata: compact({
@@ -1021,21 +934,12 @@ export function createTraceEngine(tracing, opts = {}) {
   function onAfterToolCall(evt) {
     const entry = ensureTool(evt, "hook-after");
     entry.hookTerminal = true;
-    entry.hookCompletedMs = evt.ts;
     const isError = Boolean(evt.error);
-    if (captureToolContent) {
-      applyToolIO(
-        entry,
-        {
-          input: evt.params,
-          output: evt.result !== undefined ? evt.result : evt.error,
-          isError,
-        },
-        true,
-      );
-    } else if (isError) {
-      applyToolIO(entry, { isError: true });
-    }
+    applyToolIO(entry, {
+      input: evt.params,
+      output: evt.result !== undefined ? evt.result : evt.error,
+      isError,
+    });
     try {
       entry.obs.update(
         compact({

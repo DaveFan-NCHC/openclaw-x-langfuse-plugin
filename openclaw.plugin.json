@@ -31,11 +31,6 @@
         "default": true,
         "description": "Capture tool params/results from before_tool_call and after_tool_call."
       },
-      "transcriptFallback": {
-        "type": "boolean",
-        "default": true,
-        "description": "Use bounded session JSONL and legacy trajectory parsing when hook content is unavailable."
-      },
       "maxContentBytes": {
         "type": "integer",
         "minimum": 256,

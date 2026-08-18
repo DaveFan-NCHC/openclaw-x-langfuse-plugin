@@ -102,8 +102,7 @@ function makeEngine(t, opts = {}) {
 
 // A full webchat turn, modeled on a real capture: every event shares one W3C
 // traceId; model.usage has no runId, arrives AFTER run.completed, and hangs off
-// the harness span (not the run). Tool args/results land in the trajectory only
-// at turn end, so the tool's I/O is resolved at model.usage/finalize time.
+// the harness span (not the run).
 const TRACE = "c09b6e7a5c25";
 function runSequence() {
   return [
@@ -115,10 +114,6 @@ function runSequence() {
     { type: "model.usage", ts: 1410, durationMs: 400, sessionId: "s1", agentId: "main", channel: "webchat", model: "claude-opus-4-8", provider: "anthropic", usage: { input: 100, output: 50, total: 150 }, costUsd: 0.002, trace: { traceId: TRACE, spanId: "USAGE", parentSpanId: "HARNESS" } },
   ];
 }
-
-const ioResolver = () => ({
-  tc1: { name: "web_search", input: '{"q":"x"}', output: "result text", isError: false },
-});
 
 test("run.completed finalizes with conversation hooks enabled when agent_end is missing", () => {
   const t = fakeTracing();
@@ -207,10 +202,7 @@ test("a normally completed trace finalizes before any TTL sweep", () => {
 
 test("a full turn builds one trace with everything under a single root", () => {
   const t = fakeTracing();
-  const { feed } = makeEngine(t, {
-    resolveContent: () => ({ input: "q", output: "a", sessionInput: "q" }),
-    resolveToolIO: ioResolver,
-  });
+  const { feed } = makeEngine(t);
   feed(runSequence());
 
   const roots = t.roots();
@@ -221,7 +213,7 @@ test("a full turn builds one trace with everything under a single root", () => {
   assert.equal(root.spanAttrs["langfuse.trace.name"], "webchat");
   assert.equal(root.spanAttrs["session.id"], "s1");
   assert.equal(root.ended, true);
-  assert.deepEqual(root.traceIO, { input: "q", output: "a" });
+  assert.equal(root.traceIO, undefined);
 
   const kinds = root.children.map((c) => c.opts.asType).sort();
   assert.deepEqual(kinds, ["generation", "retriever", "span"]);
@@ -234,9 +226,7 @@ test("a full turn builds one trace with everything under a single root", () => {
 
 test("the generation (model.usage, post-run.completed) nests under the run's trace", () => {
   const t = fakeTracing();
-  const { feed } = makeEngine(t, {
-    resolveContent: () => ({ input: "q", output: "a", sessionInput: "q" }),
-  });
+  const { feed } = makeEngine(t);
   feed(runSequence());
 
   assert.equal(t.roots().length, 1); // not orphaned into its own trace
@@ -247,42 +237,30 @@ test("the generation (model.usage, post-run.completed) nests under the run's tra
   assert.equal(gen.attributes.model, "claude-opus-4-8");
   assert.deepEqual(gen.attributes.usageDetails, { input: 100, output: 50, total: 150 });
   assert.deepEqual(gen.attributes.costDetails, { totalCost: 0.002 });
-  assert.equal(gen.attributes.input, "q");
+  assert.equal(gen.attributes.input, undefined);
   assert.equal(gen.opts.startTime.getTime(), 1010);
   assert.equal(gen.endTime.getTime(), 1410);
   assert.equal(gen.ended, true);
 });
 
-test("tool I/O is enriched from the trajectory at finalize, not at tool-terminal", () => {
+test("a diagnostic-only tool ends without inventing content", () => {
   const t = fakeTracing();
-  let calledAtTerminal = false;
-  const { engine, feed } = makeEngine(t, {
-    resolveToolIO: () => {
-      // The real bug: at tool.execution.completed the trajectory isn't written
-      // yet. Assert we don't end the tool with empty I/O before finalize.
-      return ioResolver();
-    },
-  });
-  // Feed everything up to (but not including) model.usage / finalize.
+  const { engine, flushDeferred } = makeEngine(t);
   const seq = runSequence();
-  const beforeUsage = seq.slice(0, seq.indexOf(seq.find((e) => e.type === "model.usage")));
-  for (const e of beforeUsage) engine.handle(e);
+  for (const e of seq.slice(0, 4)) engine.handle(e);
   const retr = t.all.find((o) => o.opts.asType === "retriever");
-  assert.ok(retr, "retriever created on tool.execution.started");
-  assert.equal(retr.ended, false, "tool stays OPEN until the trajectory is written");
-  assert.equal(retr.attributes.input, undefined, "no premature empty I/O");
-
-  // Now finalize via model.usage.
-  feed(seq);
+  assert.ok(retr);
+  assert.equal(retr.ended, false, "the hook may still arrive after diagnostics");
+  engine.handle(seq[4]);
+  flushDeferred();
   assert.equal(retr.ended, true);
-  assert.equal(retr.attributes.input, '{"q":"x"}');
-  assert.equal(retr.attributes.output, "result text");
-  assert.ok(!calledAtTerminal);
+  assert.equal(retr.attributes.input, undefined);
+  assert.equal(retr.attributes.output, undefined);
 });
 
 test("RAG/search tools become retriever observations", () => {
   const t = fakeTracing();
-  const { feed } = makeEngine(t, { resolveToolIO: ioResolver });
+  const { feed } = makeEngine(t);
   feed(runSequence());
   const ret = t.all.find((o) => o.opts.asType === "retriever");
   assert.ok(ret);
@@ -323,26 +301,26 @@ test("events sharing a traceId join one trace even with no run.started", () => {
 
 test("an orphan tool.execution.completed (no run) synthesizes and ends a span", () => {
   const t = fakeTracing();
-  const { feed } = makeEngine(t, { resolveToolIO: () => ({ x: { input: "i", output: "o" } }) });
+  const { feed } = makeEngine(t);
   feed([{ type: "tool.execution.completed", ts: 500, toolName: "search_web", toolCallId: "x", durationMs: 40 }]);
   const ret = t.byName("search_web");
   assert.ok(ret);
   assert.equal(ret.opts.asType, "retriever");
-  assert.equal(ret.ended, true); // no trace to wait on -> enriched + ended now
-  assert.equal(ret.attributes.input, "i");
+  assert.equal(ret.ended, true);
+  assert.equal(ret.attributes.input, undefined);
   assert.equal(ret.opts.startTime.getTime(), 500 - 40);
 });
 
-test("model.usage with no traceId falls back to a standalone generation root", () => {
+test("model.usage with no traceId creates a standalone generation root", () => {
   const t = fakeTracing();
-  const { feed } = makeEngine(t, { resolveContent: () => ({ input: "hi", output: "yo" }) });
+  const { feed } = makeEngine(t);
   feed([{ type: "model.usage", ts: 700, sessionId: "sX", model: "m", usage: { input: 1, output: 2 } }]);
   const roots = t.roots();
   assert.equal(roots.length, 1);
   const gen = roots[0];
   assert.equal(gen.opts.asType, "generation");
   assert.equal(gen.spanAttrs["session.id"], "sX");
-  assert.deepEqual(gen.traceIO, { input: "hi", output: "yo" });
+  assert.equal(gen.traceIO, undefined);
   assert.equal(gen.ended, true);
 });
 
@@ -393,8 +371,6 @@ test("hooks remain authoritative after more than 64 session messages", () => {
   const t = fakeTracing();
   const { engine, feed } = makeEngine(t, {
     conversationHooksEnabled: true,
-    resolveContent: () => ({ input: "stale trajectory prompt", output: "stale answer" }),
-    resolveToolIO: () => ({ tc65: { input: "stale args", output: "stale result" } }),
   });
   const ctx = {
     runId: "r65",
@@ -655,7 +631,6 @@ test("delegation llm output stays on its generation and does not become root out
   const t = fakeTracing();
   const { engine, feed } = makeEngine(t, {
     conversationHooksEnabled: true,
-    resolveContent: () => ({ input: "old question", output: "old answer" }),
   });
   const ctx = { runId: "r-no-answer", sessionId: "s-no-answer", trace: { traceId: "T-NO-ANSWER" } };
   const history = [{ role: "assistant", content: "old answer" }];
@@ -685,7 +660,7 @@ test("delegation llm output stays on its generation and does not become root out
     { model: "m", assistantTexts: ["task passed to subagent"] },
     ctx,
   );
-  // Usage commonly races ahead of agent_end and must not commit stale fallback I/O.
+  // Usage commonly races ahead of agent_end and must not promote delegation text.
   engine.handle({
     type: "model.usage",
     ts: 8,
@@ -723,24 +698,6 @@ test("a normal final llm output becomes root output when finalization hooks are 
   assert.deepEqual(t.roots()[0].traceIO, {
     input: "question",
     output: "final answer",
-  });
-});
-
-test("missing agent_end still permits root output fallback", () => {
-  const t = fakeTracing();
-  const { engine, feed } = makeEngine(t, {
-    conversationHooksEnabled: true,
-    resolveContent: () => ({ input: "fallback input", output: "fallback answer" }),
-  });
-  const ctx = { runId: "r-missing-end", sessionId: "s-missing-end", trace: { traceId: "T-MISSING-END" } };
-
-  engine.handleHook("before_agent_run", { prompt: "hook input", messages: [] }, ctx);
-  engine.handle({ type: "run.completed", ts: 10, outcome: "completed", ...ctx });
-  feed([]);
-
-  assert.deepEqual(t.roots()[0].traceIO, {
-    input: "hook input",
-    output: "fallback answer",
   });
 });
 
@@ -793,7 +750,6 @@ test("disabling conversation capture leaves conversation IO empty but tool hooks
   const { engine, feed } = makeEngine(t, {
     captureConversationContent: false,
     captureToolContent: true,
-    resolveContent: () => ({ input: "must not leak", output: "must not leak" }),
   });
   const ctx = { runId: "rd", sessionId: "sd", trace: { traceId: "TD" } };
   engine.handle({ type: "run.started", ts: 1, ...ctx });

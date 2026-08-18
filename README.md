@@ -88,7 +88,6 @@ Content capture can be constrained independently:
 | ----------------------------- | ------- | ------ |
 | `captureConversationContent`  | `true`  | Capture agent and generation prompt/response content. |
 | `captureToolContent`          | `true`  | Capture tool arguments and results. |
-| `transcriptFallback`          | `true`  | Use bounded session JSONL, then legacy trajectory, only for missing hook fields. |
 | `maxContentBytes`             | `64000` | Maximum sanitized bytes per input/output field. |
 
 Then restart the gateway:
@@ -142,11 +141,8 @@ Raw hook content is sanitized before export: credential/token/header fields are
 redacted, images/base64/binary are omitted, and each input/output is size
 bounded. Hook handlers never log full content or mutate OpenClaw payloads.
 
-If a hook field is unavailable, the bridge can parse the canonical per-session
-`<sessionId>.jsonl` transcript once per run, then consult the legacy trajectory
-as a final fallback. The trajectory `messagesSnapshot` is not considered a
-complete conversation because OpenClaw truncates arrays to 64 entries. If no
-content is available, the observation is still forwarded with empty I/O.
+If a content hook is unavailable, the observation is still forwarded with
+empty I/O; the bridge never reads session or trajectory files.
 
 ### Robustness
 
@@ -190,10 +186,10 @@ api.registerService({
     });
     setLangfuseTracerProvider(provider);
 
-    // The engine groups observations into one trace per turn, keyed by the W3C
-    // trace id OpenClaw stamps on every event, and attaches model.usage /
+    // The engine uses runId as the turn identity and W3C trace context only
+    // for correlation, then attaches model.usage /
     // tool.execution.* / context.assembled as children of that turn root.
-    engine = createTraceEngine({ startObservation }, { /* resolvers */ });
+    engine = createTraceEngine({ startObservation });
     const unsubscribe = onInternalDiagnosticEvent((evt) => engine.handle(evt));
     setInterval(() => engine.sweep(), 60_000).unref(); // reap orphans
   },

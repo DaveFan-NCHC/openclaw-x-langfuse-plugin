@@ -112,7 +112,7 @@ export function sanitizeContent(value, maxBytes = 64_000) {
 }
 
 /** Extract text from common OpenClaw/LLM message content shapes. */
-export function messageText(message) {
+function messageText(message) {
   const msg = message?.message ?? message;
   if (!msg || typeof msg !== "object") return undefined;
   if (typeof msg.content === "string") return msg.content;
@@ -189,22 +189,6 @@ export function usageDetails(usage = {}) {
 /** Convert an epoch-ms timestamp to a Date, or undefined. */
 export function toDate(ms) {
   return typeof ms === "number" ? new Date(ms) : undefined;
-}
-
-/** Attributes for a `generation` observation built from a model.call event. */
-export function generationAttributes(evt) {
-  return compact({
-    model: evt.model,
-    metadata: compact({
-      provider: evt.provider,
-      api: evt.api,
-      transport: evt.transport,
-      callId: evt.callId,
-      runId: evt.runId,
-      contextTokenBudget: evt.contextTokenBudget,
-      contextWindowSource: evt.contextWindowSource,
-    }),
-  });
 }
 
 /** Attributes for a `tool`/`retriever` observation from a tool.execution event. */

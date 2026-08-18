@@ -31,7 +31,6 @@ import {
   setLangfuseTracerProvider,
 } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
-import { makeTranscriptResolvers } from "./transcript.js";
 import {
   dispatchBridgeHook,
   ownsBridgeEngine,
@@ -58,7 +57,6 @@ function resolveConfig(pluginConfig) {
     baseUrl: cfg.baseUrl ?? process.env.LANGFUSE_BASE_URL ?? DEFAULT_BASE_URL,
     captureConversationContent: cfg.captureConversationContent !== false,
     captureToolContent: cfg.captureToolContent !== false,
-    transcriptFallback: cfg.transcriptFallback !== false,
     maxContentBytes:
       typeof cfg.maxContentBytes === "number" ? cfg.maxContentBytes : 64_000,
   };
@@ -78,8 +76,6 @@ function createLangfuseBridgeService(getPluginConfig, conversationHooksEnabled) 
   let engine = null;
   /** @type {ReturnType<typeof setInterval> | null} */
   let reaper = null;
-  /** @type {ReturnType<typeof makeTranscriptResolvers> | null} */
-  let transcriptResolvers = null;
 
   return {
     id: "langfuse-bridge",
@@ -111,16 +107,8 @@ function createLangfuseBridgeService(getPluginConfig, conversationHooksEnabled) 
 
       const tracing = { startObservation };
 
-      // Hooks are authoritative. Session/trajectory parsing is a bounded,
-      // once-per-run fallback only when a hook did not provide a field.
-      transcriptResolvers = config.transcriptFallback
-        ? makeTranscriptResolvers(ctx.stateDir, ctx.logger)
-        : null;
-
       engine = createTraceEngine(tracing, {
         logger: ctx.logger,
-        resolveContent: transcriptResolvers?.resolveContent,
-        resolveToolIO: transcriptResolvers?.resolveToolIO,
         conversationHooksEnabled,
         captureConversationContent: config.captureConversationContent,
         captureToolContent: config.captureToolContent,
@@ -167,8 +155,6 @@ function createLangfuseBridgeService(getPluginConfig, conversationHooksEnabled) 
       }
       const releasedCurrentEngine = releaseBridgeEngine(owner);
       engine = null;
-      transcriptResolvers?.clear();
-      transcriptResolvers = null;
       // Restore the default (global) provider for the Langfuse helpers.
       if (releasedCurrentEngine) setLangfuseTracerProvider(null);
       if (spanProcessor) {

@@ -9,7 +9,6 @@
     "bridge-runtime-state.js",
     "mapping.js",
     "tracer.js",
-    "transcript.js",
     "openclaw.plugin.json",
     "README.md",
     "LICENSE"
