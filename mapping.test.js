@@ -94,6 +94,50 @@ test("sanitizeContent enforces the configured byte bound", () => {
   assert.match(sanitized, /TRUNCATED/);
 });
 
+test("sanitizeContent optionally redacts high-confidence PII in free text", () => {
+  const value = [
+    "email alice@example.com",
+    "mobile 0912-345-678",
+    "card 4111 1111 1111 1111",
+    "national ID A123456789",
+  ].join("; ");
+
+  assert.equal(sanitizeContent(value, 10_000), value, "PII filtering is opt-in");
+  assert.equal(
+    sanitizeContent(value, 10_000, { redactPii: true }),
+    "email [REDACTED_EMAIL]; mobile [REDACTED_PHONE]; card [REDACTED_CREDIT_CARD]; national ID [REDACTED_NATIONAL_ID]",
+  );
+});
+
+test("sanitizeContent validates checksum-based PII before redacting", () => {
+  const value =
+    "invalid cards 4111 1111 1111 1112 and 0000 0000 0000 0000; invalid ID A123456788";
+  assert.equal(sanitizeContent(value, 10_000, { redactPii: true }), value);
+});
+
+test("sanitizeContent redacts explicit PII fields without mutating input", () => {
+  const original = {
+    email_address: "not-even-an-email",
+    phoneNumber: 912345678,
+    profile: {
+      fullName: "王小明",
+      streetAddress: "台北市信義區測試路 1 號",
+    },
+    displayName: "public nickname",
+  };
+
+  assert.deepEqual(sanitizeContent(original, 10_000, { redactPii: true }), {
+    email_address: "[REDACTED_EMAIL]",
+    phoneNumber: "[REDACTED_PHONE]",
+    profile: {
+      fullName: "[REDACTED_PERSON]",
+      streetAddress: "[REDACTED_ADDRESS]",
+    },
+    displayName: "public nickname",
+  });
+  assert.equal(original.profile.fullName, "王小明");
+});
+
 test("lastAssistantText ignores tool-only blocks and unwraps message rows", () => {
   assert.equal(
     lastAssistantText([

@@ -70,6 +70,7 @@ export function createTraceEngine(tracing, opts = {}) {
     conversationHooksEnabled = false,
     captureConversationContent = true,
     captureToolContent = true,
+    piiFiltering = false,
     maxContentBytes = 64_000,
   } = opts;
 
@@ -82,7 +83,7 @@ export function createTraceEngine(tracing, opts = {}) {
   const subagentsBySession = new Map();
 
   function clean(value) {
-    return sanitizeContent(value, maxContentBytes);
+    return sanitizeContent(value, maxContentBytes, { redactPii: piiFiltering });
   }
 
   function touch(entry) {

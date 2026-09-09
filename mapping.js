@@ -22,14 +22,102 @@ const IMAGE_KEY_RE = /^(?:image|image_url|imageUrl|thumbnail|data)$/i;
 const IMAGE_TYPE_RE = /^(?:image|image_url|input_image|output_image)$/i;
 const BASE64_RE = /^[A-Za-z0-9+/=_-]+$/;
 
-function redactString(value) {
+// PII filtering is deliberately conservative: structured fields with an
+// unambiguous PII key are always redacted, while free text is limited to
+// formats we can recognize with high confidence. Names and unstructured
+// addresses require language-aware NER and are outside this synchronous pass.
+const PII_KEY_MARKERS = new Map([
+  ["email", "[REDACTED_EMAIL]"],
+  ["emailaddress", "[REDACTED_EMAIL]"],
+  ["phone", "[REDACTED_PHONE]"],
+  ["phonenumber", "[REDACTED_PHONE]"],
+  ["telephone", "[REDACTED_PHONE]"],
+  ["tel", "[REDACTED_PHONE]"],
+  ["mobile", "[REDACTED_PHONE]"],
+  ["mobilenumber", "[REDACTED_PHONE]"],
+  ["nationalid", "[REDACTED_NATIONAL_ID]"],
+  ["nationalidnumber", "[REDACTED_NATIONAL_ID]"],
+  ["identitycard", "[REDACTED_NATIONAL_ID]"],
+  ["identitycardnumber", "[REDACTED_NATIONAL_ID]"],
+  ["personalid", "[REDACTED_NATIONAL_ID]"],
+  ["creditcard", "[REDACTED_CREDIT_CARD]"],
+  ["creditcardnumber", "[REDACTED_CREDIT_CARD]"],
+  ["cardnumber", "[REDACTED_CREDIT_CARD]"],
+  ["dateofbirth", "[REDACTED_DATE_OF_BIRTH]"],
+  ["dob", "[REDACTED_DATE_OF_BIRTH]"],
+  ["firstname", "[REDACTED_PERSON]"],
+  ["lastname", "[REDACTED_PERSON]"],
+  ["fullname", "[REDACTED_PERSON]"],
+  ["streetaddress", "[REDACTED_ADDRESS]"],
+  ["postaladdress", "[REDACTED_ADDRESS]"],
+]);
+
+const EMAIL_RE =
+  /\b[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+\b/gi;
+const TW_MOBILE_RE =
+  /(^|[^\d])(?:(?:(?:\+?886|00886)[ .-]?(?:0)?|0)9\d{2}[ .-]?\d{3}[ .-]?\d{3})(?!\d)/g;
+const CREDIT_CARD_CANDIDATE_RE = /(^|[^\d])((?:\d[ -]?){12,18}\d)(?!\d)/g;
+const TW_NATIONAL_ID_CANDIDATE_RE = /(^|[^A-Z0-9])([A-Z][12]\d{8})(?![A-Z0-9])/gi;
+const TW_ID_LETTERS = "ABCDEFGHJKLMNPQRSTUVXYWZIO";
+
+function piiMarkerForKey(key) {
+  if (typeof key !== "string") return undefined;
+  return PII_KEY_MARKERS.get(key.toLowerCase().replace(/[-_\s]/g, ""));
+}
+
+function passesLuhn(candidate) {
+  const digits = candidate.replace(/[^\d]/g, "");
+  if (digits.length < 13 || digits.length > 19) return false;
+  // Repeated digits such as test fixtures full of zeroes can satisfy the
+  // checksum but are not useful payment-card candidates.
+  if (/^(\d)\1+$/.test(digits)) return false;
+  let sum = 0;
+  let doubleDigit = false;
+  for (let index = digits.length - 1; index >= 0; index -= 1) {
+    let digit = Number(digits[index]);
+    if (doubleDigit) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    doubleDigit = !doubleDigit;
+  }
+  return sum % 10 === 0;
+}
+
+function isTwNationalId(candidate) {
+  const normalized = candidate.toUpperCase();
+  const letterValue = TW_ID_LETTERS.indexOf(normalized[0]) + 10;
+  if (letterValue < 10) return false;
+  let sum = Math.floor(letterValue / 10) + (letterValue % 10) * 9;
+  for (let index = 1; index <= 8; index += 1) {
+    sum += Number(normalized[index]) * (9 - index);
+  }
+  sum += Number(normalized[9]);
+  return sum % 10 === 0;
+}
+
+function redactPiiString(value) {
   return value
+    .replace(EMAIL_RE, "[REDACTED_EMAIL]")
+    .replace(TW_MOBILE_RE, "$1[REDACTED_PHONE]")
+    .replace(CREDIT_CARD_CANDIDATE_RE, (match, prefix, candidate) =>
+      passesLuhn(candidate) ? `${prefix}[REDACTED_CREDIT_CARD]` : match,
+    )
+    .replace(TW_NATIONAL_ID_CANDIDATE_RE, (match, prefix, candidate) =>
+      isTwNationalId(candidate) ? `${prefix}[REDACTED_NATIONAL_ID]` : match,
+    );
+}
+
+function redactString(value, redactPii) {
+  const redacted = value
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 [REDACTED]")
     .replace(
       /\b(authorization|proxy-authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|auth[-_]?token|token|password|passwd|secret|credential)\b(\s*[=:]\s*)([^\s,;&]+)/gi,
       "$1$2[REDACTED]",
     )
     .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_KEY]");
+  return redactPii ? redactPiiString(redacted) : redacted;
 }
 
 function looksLikeBase64(value) {
@@ -42,14 +130,19 @@ function looksLikeBase64(value) {
  * Hook values are raw host data, so binary/image bodies are represented by a
  * marker and never serialized. The input object is never mutated.
  */
-export function sanitizeContent(value, maxBytes = 64_000) {
+export function sanitizeContent(value, maxBytes = 64_000, options = {}) {
   if (value === undefined || value === null) return value;
   const limit = Number.isFinite(maxBytes) ? Math.max(256, Math.floor(maxBytes)) : 64_000;
+  const redactPii = options?.redactPii === true;
   const seen = new WeakSet();
 
   function visit(current, key, depth) {
     if (current === undefined || current === null) return current;
     if (SENSITIVE_KEY_RE.test(key ?? "")) return "[REDACTED]";
+    if (redactPii) {
+      const marker = piiMarkerForKey(key);
+      if (marker) return marker;
+    }
     if (Buffer.isBuffer(current)) return `[OMITTED_BINARY ${current.byteLength} bytes]`;
     if (ArrayBuffer.isView(current)) {
       return `[OMITTED_BINARY ${current.byteLength} bytes]`;
@@ -62,7 +155,7 @@ export function sanitizeContent(value, maxBytes = 64_000) {
         return "[OMITTED_IMAGE]";
       }
       if (looksLikeBase64(current)) return "[OMITTED_BASE64]";
-      return redactString(current);
+      return redactString(current, redactPii);
     }
     if (typeof current === "number" || typeof current === "boolean") return current;
     if (typeof current === "bigint") return String(current);

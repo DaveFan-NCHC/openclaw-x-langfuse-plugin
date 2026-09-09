@@ -57,6 +57,7 @@ function resolveConfig(pluginConfig) {
     baseUrl: cfg.baseUrl ?? process.env.LANGFUSE_BASE_URL ?? DEFAULT_BASE_URL,
     captureConversationContent: cfg.captureConversationContent !== false,
     captureToolContent: cfg.captureToolContent !== false,
+    piiFiltering: cfg.piiFiltering === true,
     maxContentBytes:
       typeof cfg.maxContentBytes === "number" ? cfg.maxContentBytes : 64_000,
   };
@@ -112,6 +113,7 @@ function createLangfuseBridgeService(getPluginConfig, conversationHooksEnabled) 
         conversationHooksEnabled,
         captureConversationContent: config.captureConversationContent,
         captureToolContent: config.captureToolContent,
+        piiFiltering: config.piiFiltering,
         maxContentBytes: config.maxContentBytes,
       });
       publishBridgeEngine(owner, engine);

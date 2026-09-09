@@ -59,7 +59,8 @@ Enable the plugin and provide Langfuse credentials in `openclaw.json`:
         "config": {
           "publicKey": "pk-lf-...",
           "secretKey": "sk-lf-...",
-          "baseUrl": "https://cloud.langfuse.com"
+          "baseUrl": "https://cloud.langfuse.com",
+          "piiFiltering": true
         }
       }
     }
@@ -88,6 +89,7 @@ Content capture can be constrained independently:
 | ----------------------------- | ------- | ------ |
 | `captureConversationContent`  | `true`  | Capture agent and generation prompt/response content. |
 | `captureToolContent`          | `true`  | Capture tool arguments and results. |
+| `piiFiltering`                | `false` | Locally redact high-confidence PII before captured content is exported. |
 | `maxContentBytes`             | `64000` | Maximum sanitized bytes per input/output field. |
 
 Then restart the gateway:
@@ -139,7 +141,12 @@ trace id.
 
 Raw hook content is sanitized before export: credential/token/header fields are
 redacted, images/base64/binary are omitted, and each input/output is size
-bounded. Hook handlers never log full content or mutate OpenClaw payloads.
+bounded. When `piiFiltering` is enabled, the same local synchronous pass also
+redacts email addresses, Taiwan mobile numbers, Luhn-valid payment card numbers,
+checksum-valid Taiwan national IDs, and values stored under explicit PII field
+names (for example `email`, `phoneNumber`, `fullName`, and `streetAddress`). It
+does not attempt model-based detection of names or addresses embedded in free
+text. Hook handlers never log full content or mutate OpenClaw payloads.
 
 If a content hook is unavailable, the observation is still forwarded with
 empty I/O; the bridge never reads session or trajectory files.

@@ -115,6 +115,25 @@ function runSequence() {
   ];
 }
 
+test("PII filtering is applied to captured conversation content", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, {
+    conversationHooksEnabled: true,
+    piiFiltering: true,
+  });
+  const ctx = { runId: "r-pii", sessionId: "s-pii", trace: { traceId: "T-PII" } };
+
+  engine.handleHook(
+    "before_agent_run",
+    { prompt: "Email alice@example.com or call 0912-345-678", messages: [] },
+    ctx,
+  );
+
+  assert.deepEqual(t.roots()[0].traceIO, {
+    input: "Email [REDACTED_EMAIL] or call [REDACTED_PHONE]",
+  });
+});
+
 test("run.completed finalizes with conversation hooks enabled when agent_end is missing", () => {
   const t = fakeTracing();
   const { engine, flushDeferred } = makeEngine(t, { conversationHooksEnabled: true });
