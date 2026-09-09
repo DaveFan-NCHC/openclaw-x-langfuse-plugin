@@ -32,11 +32,14 @@ import {
 } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
 import {
-  dispatchBridgeHook,
   ownsBridgeEngine,
   publishBridgeEngine,
   releaseBridgeEngine,
 } from "./bridge-runtime-state.js";
+import {
+  allowsConversationAccess,
+  registerBridgeHooks,
+} from "./plugin-lifecycle.js";
 
 const DEFAULT_BASE_URL = "https://cloud.langfuse.com";
 
@@ -62,7 +65,7 @@ function resolveConfig(pluginConfig) {
   };
 }
 
-function createLangfuseBridgeService(getPluginConfig, conversationHooksEnabled) {
+function createLangfuseBridgeService(getPluginConfig, pluginId) {
   // A unique token prevents an older service instance from clearing a newer
   // engine when Gateway plugin reload lifecycles overlap.
   const owner = Symbol("langfuse-bridge-service");
@@ -83,6 +86,8 @@ function createLangfuseBridgeService(getPluginConfig, conversationHooksEnabled) 
     async start(ctx) {
       const config = resolveConfig(getPluginConfig());
       const { publicKey, secretKey, baseUrl } = config;
+      const conversationHooksEnabled =
+        config.captureConversationContent && allowsConversationAccess(ctx.config, pluginId);
 
       if (!publicKey || !secretKey) {
         ctx.logger.warn(
@@ -96,6 +101,12 @@ function createLangfuseBridgeService(getPluginConfig, conversationHooksEnabled) 
           "langfuse-bridge: diagnostics are disabled (config.diagnostics.enabled === false); no events will be emitted, not starting",
         );
         return;
+      }
+
+      if (config.captureConversationContent && !conversationHooksEnabled) {
+        ctx.logger.warn(
+          `langfuse-bridge: raw conversation hooks are disabled; set plugins.entries.${pluginId}.hooks.allowConversationAccess=true to capture agent/generation input and output (tool and subagent lifecycle hooks remain active)`,
+        );
       }
 
       // Isolated OTel pipeline: our SpanProcessor lives on a dedicated provider,
@@ -183,44 +194,9 @@ export default definePluginEntry({
   description: "Correlates OpenClaw hooks and diagnostics in Langfuse",
   register(api) {
     const config = resolveConfig(api.pluginConfig);
-    const conversationAllowed =
-      api.config?.plugins?.entries?.[api.id]?.hooks?.allowConversationAccess === true;
-    const conversationHooksEnabled =
-      config.captureConversationContent && conversationAllowed;
-
-    // Tool and subagent lifecycle hooks do not expose raw conversation content
-    // and remain available even when conversation access was not granted.
-    for (const hookName of [
-      "before_tool_call",
-      "after_tool_call",
-      "subagent_spawned",
-      "subagent_ended",
-    ]) {
-      api.on(hookName, (event, ctx) => {
-        dispatchBridgeHook(hookName, event, ctx);
-      });
-    }
-
-    if (conversationHooksEnabled) {
-      for (const hookName of [
-        "before_agent_run",
-        "llm_input",
-        "llm_output",
-        "before_agent_finalize",
-        "agent_end",
-      ]) {
-        api.on(hookName, (event, ctx) => {
-          dispatchBridgeHook(hookName, event, ctx);
-        });
-      }
-    } else if (config.captureConversationContent) {
-      api.logger.warn(
-        "langfuse-bridge: raw conversation hooks are disabled; set plugins.entries.langfuse-bridge.hooks.allowConversationAccess=true to capture agent/generation input and output (tool and subagent lifecycle hooks remain active)",
-      );
-    }
-
-    api.registerService(
-      createLangfuseBridgeService(() => api.pluginConfig, conversationHooksEnabled),
-    );
+    registerBridgeHooks(api, {
+      captureConversationContent: config.captureConversationContent,
+    });
+    api.registerService(createLangfuseBridgeService(() => api.pluginConfig, api.id));
   },
 });
