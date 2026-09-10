@@ -31,6 +31,11 @@
         "default": true,
         "description": "Capture tool params/results from before_tool_call and after_tool_call."
       },
+      "piiFiltering": {
+        "type": "boolean",
+        "default": true,
+        "description": "Redact high-confidence PII from captured content locally before export: email addresses, Taiwan mobile numbers, Luhn-valid payment card numbers, Taiwan national IDs, and values under explicit PII field names."
+      },
       "maxContentBytes": {
         "type": "integer",
         "minimum": 256,
