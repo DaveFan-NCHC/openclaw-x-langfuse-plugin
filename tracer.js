@@ -70,7 +70,7 @@ export function createTraceEngine(tracing, opts = {}) {
     conversationHooksEnabled = false,
     captureConversationContent = true,
     captureToolContent = true,
-    piiFiltering = false,
+    piiFiltering = true,
     maxContentBytes = 64_000,
   } = opts;
 

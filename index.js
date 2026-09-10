@@ -57,7 +57,7 @@ function resolveConfig(pluginConfig) {
     baseUrl: cfg.baseUrl ?? process.env.LANGFUSE_BASE_URL ?? DEFAULT_BASE_URL,
     captureConversationContent: cfg.captureConversationContent !== false,
     captureToolContent: cfg.captureToolContent !== false,
-    piiFiltering: cfg.piiFiltering === true,
+    piiFiltering: cfg.piiFiltering !== false,
     maxContentBytes:
       typeof cfg.maxContentBytes === "number" ? cfg.maxContentBytes : 64_000,
   };
