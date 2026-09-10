@@ -16,8 +16,8 @@
 // privileged capability the runtime injects only for the bundled
 // `diagnostics-otel`/`diagnostics-prometheus` services (it carries captured
 // prompt/response private data); third-party plugins never receive it. The
-// public listener delivers the same event bodies (minus private data), which
-// is all this bridge needs — every field we map lives on the event itself.
+// public listener provides trace structure, timing, usage, and status. Typed
+// plugin hooks provide raw I/O when the operator explicitly grants access.
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import {
@@ -31,7 +31,15 @@ import {
   setLangfuseTracerProvider,
 } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
-import { makeContentResolver, makeToolIOResolver } from "./transcript.js";
+import {
+  ownsBridgeEngine,
+  publishBridgeEngine,
+  releaseBridgeEngine,
+} from "./bridge-runtime-state.js";
+import {
+  allowsConversationAccess,
+  registerBridgeHooks,
+} from "./plugin-lifecycle.js";
 
 const DEFAULT_BASE_URL = "https://cloud.langfuse.com";
 
@@ -50,10 +58,17 @@ function resolveConfig(pluginConfig) {
     publicKey: cfg.publicKey ?? process.env.LANGFUSE_PUBLIC_KEY,
     secretKey: cfg.secretKey ?? process.env.LANGFUSE_SECRET_KEY,
     baseUrl: cfg.baseUrl ?? process.env.LANGFUSE_BASE_URL ?? DEFAULT_BASE_URL,
+    captureConversationContent: cfg.captureConversationContent !== false,
+    captureToolContent: cfg.captureToolContent !== false,
+    maxContentBytes:
+      typeof cfg.maxContentBytes === "number" ? cfg.maxContentBytes : 64_000,
   };
 }
 
-function createLangfuseBridgeService(getPluginConfig) {
+function createLangfuseBridgeService(getPluginConfig, pluginId) {
+  // A unique token prevents an older service instance from clearing a newer
+  // engine when Gateway plugin reload lifecycles overlap.
+  const owner = Symbol("langfuse-bridge-service");
   /** @type {import("@opentelemetry/sdk-trace-node").NodeTracerProvider | null} */
   let provider = null;
   /** @type {import("@langfuse/otel").LangfuseSpanProcessor | null} */
@@ -69,9 +84,10 @@ function createLangfuseBridgeService(getPluginConfig) {
     id: "langfuse-bridge",
 
     async start(ctx) {
-      const { publicKey, secretKey, baseUrl } = resolveConfig(
-        getPluginConfig(),
-      );
+      const config = resolveConfig(getPluginConfig());
+      const { publicKey, secretKey, baseUrl } = config;
+      const conversationHooksEnabled =
+        config.captureConversationContent && allowsConversationAccess(ctx.config, pluginId);
 
       if (!publicKey || !secretKey) {
         ctx.logger.warn(
@@ -87,6 +103,12 @@ function createLangfuseBridgeService(getPluginConfig) {
         return;
       }
 
+      if (config.captureConversationContent && !conversationHooksEnabled) {
+        ctx.logger.warn(
+          `langfuse-bridge: raw conversation hooks are disabled; set plugins.entries.${pluginId}.hooks.allowConversationAccess=true to capture agent/generation input and output (tool and subagent lifecycle hooks remain active)`,
+        );
+      }
+
       // Isolated OTel pipeline: our SpanProcessor lives on a dedicated provider,
       // and we point the Langfuse tracing helpers at it. This keeps us off the
       // global tracer provider that OpenClaw's diagnostics-otel may own.
@@ -96,29 +118,29 @@ function createLangfuseBridgeService(getPluginConfig) {
 
       const tracing = { startObservation };
 
-      // Prompt/response text and tool args/results are not delivered to
-      // third-party plugins (they're private data given only to bundled
-      // services), so we recover them best-effort from OpenClaw's per-session
-      // trajectory transcript under ctx.stateDir to populate observation IO.
-      const resolveContent = makeContentResolver(ctx.stateDir, ctx.logger);
-      const resolveToolIO = makeToolIOResolver(ctx.stateDir, ctx.logger);
-
       engine = createTraceEngine(tracing, {
         logger: ctx.logger,
-        resolveContent,
-        resolveToolIO,
+        conversationHooksEnabled,
+        captureConversationContent: config.captureConversationContent,
+        captureToolContent: config.captureToolContent,
+        maxContentBytes: config.maxContentBytes,
       });
+      publishBridgeEngine(owner, engine);
 
       // `onInternalDiagnosticEvent` invokes the listener as
       // (event, metadata) => void. We only need the event body; the engine
       // ignores unrelated event types and catches its own errors, so it never
       // throws into the bus.
-      unsubscribe = onInternalDiagnosticEvent((evt) => engine?.handle(evt));
+      unsubscribe = onInternalDiagnosticEvent((evt) => {
+        if (ownsBridgeEngine(owner)) engine?.handle(evt);
+      });
 
       // Idle reaper: ends observations orphaned by dropped start/complete events
       // (these event types are async-queued and droppable under load). Unref'd
       // so it never keeps the process alive.
-      reaper = setInterval(() => engine?.sweep(), REAPER_INTERVAL_MS);
+      reaper = setInterval(() => {
+        if (ownsBridgeEngine(owner)) engine?.sweep();
+      }, REAPER_INTERVAL_MS);
       reaper.unref?.();
 
       ctx.logger.info(
@@ -142,9 +164,10 @@ function createLangfuseBridgeService(getPluginConfig) {
       } catch {
         // best-effort flush of in-flight observations
       }
+      const releasedCurrentEngine = releaseBridgeEngine(owner);
       engine = null;
       // Restore the default (global) provider for the Langfuse helpers.
-      setLangfuseTracerProvider(null);
+      if (releasedCurrentEngine) setLangfuseTracerProvider(null);
       if (spanProcessor) {
         try {
           await spanProcessor.forceFlush();
@@ -168,8 +191,12 @@ function createLangfuseBridgeService(getPluginConfig) {
 export default definePluginEntry({
   id: "langfuse-bridge",
   name: "Langfuse Bridge",
-  description: "Forwards OpenClaw model usage diagnostics to Langfuse",
+  description: "Correlates OpenClaw hooks and diagnostics in Langfuse",
   register(api) {
-    api.registerService(createLangfuseBridgeService(() => api.pluginConfig));
+    const config = resolveConfig(api.pluginConfig);
+    registerBridgeHooks(api, {
+      captureConversationContent: config.captureConversationContent,
+    });
+    api.registerService(createLangfuseBridgeService(() => api.pluginConfig, api.id));
   },
 });

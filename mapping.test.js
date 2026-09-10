@@ -4,12 +4,12 @@ import {
   compact,
   classifyToolType,
   usageDetails,
-  generationAttributes,
   toolAttributes,
   contextSummary,
   errorAttributes,
+  sanitizeContent,
+  lastAssistantText,
 } from "./mapping.js";
-import { extractContent, extractToolIO, trajectoryPath } from "./transcript.js";
 
 test("compact drops undefined and null", () => {
   assert.deepEqual(compact({ a: 1, b: undefined, c: null, d: 0, e: "" }), {
@@ -45,19 +45,6 @@ test("usageDetails maps OpenClaw usage to snake_case, dropping empties", () => {
   assert.deepEqual(usageDetails(), {});
 });
 
-test("generationAttributes carries model + correlation metadata", () => {
-  const attrs = generationAttributes({
-    model: "claude-opus-4-8",
-    provider: "anthropic",
-    api: "messages",
-    callId: "c1",
-    runId: "r1",
-  });
-  assert.equal(attrs.model, "claude-opus-4-8");
-  assert.equal(attrs.metadata.provider, "anthropic");
-  assert.equal(attrs.metadata.callId, "c1");
-});
-
 test("toolAttributes carries source/owner/paramsSummary", () => {
   const attrs = toolAttributes({
     toolSource: "mcp",
@@ -84,126 +71,35 @@ test("errorAttributes sets ERROR level + status from category/kind/denied", () =
   assert.equal(errorAttributes({ deniedReason: "policy" }).statusMessage, "policy");
 });
 
-test("extractContent reads the last model.completed turn", () => {
-  const text = [
-    JSON.stringify({ type: "prompt.submitted", data: { prompt: "old prompt" } }),
-    JSON.stringify({
-      type: "model.completed",
-      data: { finalPromptText: "old prompt", assistantTexts: ["old answer"] },
-    }),
-    JSON.stringify({ type: "prompt.submitted", data: { prompt: "new prompt" } }),
-    JSON.stringify({
-      type: "model.completed",
-      data: { finalPromptText: "new prompt", assistantTexts: ["line1", "line2"] },
-    }),
-    "", // trailing newline
-  ].join("\n");
-  assert.deepEqual(extractContent(text), {
-    input: "new prompt",
-    output: "line1\nline2",
-    sessionInput: "old prompt", // first prompt in the session
-  });
+test("sanitizeContent redacts credentials, omits images/binary, and does not mutate", () => {
+  const original = {
+    token: "super-secret-token",
+    headers: { Authorization: "Bearer abcdefghijklmnop" },
+    prompt: "use api_key=abcdefghijklmnop",
+    image: `data:image/png;base64,${"A".repeat(1024)}`,
+    bytes: Buffer.from("secret bytes"),
+  };
+  const sanitized = sanitizeContent(original, 10_000);
+  assert.equal(sanitized.token, "[REDACTED]");
+  assert.equal(sanitized.headers.Authorization, "[REDACTED]");
+  assert.match(sanitized.prompt, /\[REDACTED\]/);
+  assert.equal(sanitized.image, "[OMITTED_IMAGE]");
+  assert.match(sanitized.bytes, /OMITTED_BINARY/);
+  assert.equal(original.token, "super-secret-token");
 });
 
-test("extractContent tolerates a truncated leading line and falls back to prompt.submitted", () => {
-  const text = [
-    '{"type":"model.compl', // truncated (windowed read) -> skipped
-    JSON.stringify({ type: "prompt.submitted", data: { prompt: "only prompt" } }),
-  ].join("\n");
-  assert.deepEqual(extractContent(text), {
-    input: "only prompt",
-    sessionInput: "only prompt",
-  });
+test("sanitizeContent enforces the configured byte bound", () => {
+  const sanitized = sanitizeContent("long content: ".repeat(1000), 512);
+  assert.ok(Buffer.byteLength(sanitized, "utf8") <= 512);
+  assert.match(sanitized, /TRUNCATED/);
 });
 
-test("extractContent returns null when nothing usable", () => {
-  assert.equal(extractContent("\n\nnot json\n"), null);
-});
-
-test("extractToolIO pulls per-tool input/output from messagesSnapshot", () => {
-  const text = JSON.stringify({
-    type: "model.completed",
-    data: {
-      messagesSnapshot: [
-        { role: "user", content: "find the docs" },
-        {
-          role: "assistant",
-          content: [
-            { type: "text", text: "I'll search." },
-            {
-              type: "toolCall",
-              id: "tc1",
-              name: "vector_search",
-              arguments: { query: "docs" },
-            },
-          ],
-        },
-        {
-          role: "toolResult",
-          toolCallId: "tc1",
-          toolName: "vector_search",
-          content: [{ type: "text", text: "doc A\ndoc B" }],
-          isError: false,
-        },
-      ],
-    },
-  });
-  assert.deepEqual(extractToolIO(text), {
-    tc1: {
-      name: "vector_search",
-      input: '{"query":"docs"}',
-      output: "doc A\ndoc B",
-      isError: false,
-    },
-  });
-});
-
-test("extractToolIO uses the latest (cumulative) snapshot and flags errors", () => {
-  const text = [
-    JSON.stringify({
-      type: "model.completed",
-      data: { messagesSnapshot: [{ role: "user", content: "old" }] },
-    }),
-    JSON.stringify({
-      type: "model.completed",
-      data: {
-        messagesSnapshot: [
-          {
-            role: "assistant",
-            content: [{ type: "toolCall", id: "tc9", name: "bash", arguments: "ls" }],
-          },
-          {
-            role: "toolResult",
-            toolCallId: "tc9",
-            toolName: "bash",
-            content: "command not found",
-            isError: true,
-          },
-        ],
-      },
-    }),
-  ].join("\n");
-  assert.deepEqual(extractToolIO(text), {
-    tc9: { name: "bash", input: "ls", output: "command not found", isError: true },
-  });
-});
-
-test("extractToolIO returns null when no tool activity", () => {
-  const text = JSON.stringify({
-    type: "model.completed",
-    data: { messagesSnapshot: [{ role: "user", content: "hi" }] },
-  });
-  assert.equal(extractToolIO(text), null);
-  assert.equal(extractToolIO("not json"), null);
-});
-
-test("trajectoryPath builds <stateDir>/agents/<agentId>/sessions/<id>.trajectory.jsonl", () => {
+test("lastAssistantText ignores tool-only blocks and unwraps message rows", () => {
   assert.equal(
-    trajectoryPath("/state", "main", "abc"),
-    "/state/agents/main/sessions/abc.trajectory.jsonl",
-  );
-  assert.equal(
-    trajectoryPath("/state", undefined, "abc"),
-    "/state/agents/main/sessions/abc.trajectory.jsonl",
+    lastAssistantText([
+      { role: "assistant", content: [{ type: "toolCall", id: "x" }] },
+      { message: { role: "assistant", content: [{ type: "text", text: "answer" }] } },
+    ]),
+    "answer",
   );
 });
