@@ -7,6 +7,8 @@ export const TOOL_AND_SUBAGENT_HOOKS = [
   "subagent_ended",
 ];
 
+export const MODEL_CALL_HOOKS = ["model_call_started", "model_call_ended"];
+
 export const CONVERSATION_HOOKS = [
   "before_agent_run",
   "llm_input",
@@ -37,10 +39,15 @@ export function allowsConversationAccess(config, pluginId) {
  * Always offer every hook to OpenClaw. Its registry owns the authoritative
  * hook policy and will reject conversation hooks when access was not granted.
  */
-export function registerBridgeHooks(api, { captureConversationContent = true } = {}) {
-  const hookNames = captureConversationContent
-    ? [...TOOL_AND_SUBAGENT_HOOKS, ...CONVERSATION_HOOKS]
-    : TOOL_AND_SUBAGENT_HOOKS;
+export function registerBridgeHooks(
+  api,
+  { captureConversationContent = true, traceLayout = "timeline" } = {},
+) {
+  const hookNames = [
+    ...(traceLayout === "timeline" ? MODEL_CALL_HOOKS : []),
+    ...TOOL_AND_SUBAGENT_HOOKS,
+    ...(captureConversationContent ? CONVERSATION_HOOKS : []),
+  ];
   for (const hookName of hookNames) {
     api.on(hookName, (event, ctx) => {
       dispatchBridgeHook(hookName, event, ctx);

@@ -21,6 +21,12 @@
         "type": "string",
         "description": "Langfuse host. Falls back to LANGFUSE_BASE_URL, then https://cloud.langfuse.com."
       },
+      "traceLayout": {
+        "type": "string",
+        "enum": ["timeline", "legacy"],
+        "default": "timeline",
+        "description": "Use one generation per model call interleaved with tools, or retain the legacy run-wide generation."
+      },
       "captureConversationContent": {
         "type": "boolean",
         "default": true,

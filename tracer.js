@@ -15,6 +15,8 @@ import {
   errorAttributes,
   sanitizeContent,
   lastAssistantText,
+  normalizeTimelineMessage,
+  timelinePhases,
 } from "./mapping.js";
 
 const DEFAULT_TTL_MS = 5 * 60_000;
@@ -50,6 +52,12 @@ function toolKey(evt) {
   return evt?.runId && evt?.toolName ? `tool:${evt.runId}:${evt.toolName}` : undefined;
 }
 
+function modelCallKey(evt) {
+  if (!evt?.callId) return undefined;
+  const scope = evt?.runId ?? traceIdOf(evt) ?? sessionOf(evt) ?? "orphan";
+  return `model:${scope}:${evt.callId}`;
+}
+
 function outputFromLlmEvent(evt) {
   if (Array.isArray(evt?.assistantTexts) && evt.assistantTexts.length > 0) {
     return evt.assistantTexts.length === 1 ? evt.assistantTexts[0] : evt.assistantTexts;
@@ -70,6 +78,7 @@ export function createTraceEngine(tracing, opts = {}) {
     conversationHooksEnabled = false,
     captureConversationContent = true,
     captureToolContent = true,
+    traceLayout = "timeline",
     piiFiltering = true,
     maxContentBytes = 64_000,
   } = opts;
@@ -78,6 +87,7 @@ export function createTraceEngine(tracing, opts = {}) {
   const rootsByTrace = new Map();
   const rootsByRun = new Map();
   const toolsByKey = new Map();
+  const modelCallsByKey = new Map();
   const generationsByRun = new Map();
   const subagentsByRun = new Map();
   const subagentsBySession = new Map();
@@ -107,6 +117,9 @@ export function createTraceEngine(tracing, opts = {}) {
     if (entry.runId && rootsByRun.get(entry.runId) === entry) rootsByRun.delete(entry.runId);
     for (const key of entry.toolKeys ?? []) {
       if (toolsByKey.get(key) === entry) toolsByKey.delete(key);
+    }
+    for (const key of entry.modelCallKeys ?? []) {
+      if (modelCallsByKey.get(key) === entry) modelCallsByKey.delete(key);
     }
     entry.parentRoot?.children.delete(entry);
   }
@@ -328,6 +341,9 @@ export function createTraceEngine(tracing, opts = {}) {
       },
       children: new Set(),
       generations: [],
+      modelCalls: [],
+      llmInput: undefined,
+      agentEnded: false,
       runCompleted: false,
       llmOutputCandidate: undefined,
       delegatedToSubagent: false,
@@ -491,24 +507,236 @@ export function createTraceEngine(tracing, opts = {}) {
     return list;
   }
 
-  function createGeneration(evt, root, attributes = {}, startMs = evt?.ts) {
+  function createGeneration(
+    evt,
+    root,
+    attributes = {},
+    startMs = evt?.ts,
+    name = evt?.model ?? "model",
+  ) {
+    const { metadata, ...generationAttributes } = attributes;
     const entry = createChild(evt, root, {
-      name: evt?.model ?? "model",
+      name,
       asType: "generation",
       attributes: compact({
         model: evt?.model,
-        ...attributes,
-        metadata: compact({ provider: evt?.provider, runId: evt?.runId }),
+        ...generationAttributes,
+        metadata: compact({
+          provider: evt?.provider,
+          runId: evt?.runId,
+          ...metadata,
+        }),
       }),
       startMs,
     });
-    entry.inputSet = attributes.input !== undefined;
-    entry.outputSet = attributes.output !== undefined;
-    entry.outputEventReceived = attributes.output !== undefined;
+    entry.inputSet = generationAttributes.input !== undefined;
+    entry.outputSet = generationAttributes.output !== undefined;
+    entry.outputEventReceived = generationAttributes.output !== undefined;
     entry.diagnosticCompleted = false;
     const list = generationList(evt?.runId, root);
     list.push(entry);
     return entry;
+  }
+
+  function initialTimelineInput(root) {
+    const prompt = root?.llmInput?.prompt ?? root?.traceIO?.input;
+    return prompt !== undefined ? [{ role: "user", content: prompt }] : undefined;
+  }
+
+  function successfulModelCalls(root) {
+    return (root?.modelCalls ?? [])
+      .filter((entry) => entry.modelCallOutcome !== "error")
+      .toSorted(
+        (left, right) =>
+          (left.startedMs ?? Number.MAX_SAFE_INTEGER) -
+          (right.startedMs ?? Number.MAX_SAFE_INTEGER),
+      );
+  }
+
+  function applyTimelinePhase(entry, phase, fallbackInput, complete = true) {
+    if (!entry || !phase || entry.ended) return;
+    const input = phase.input ?? fallbackInput;
+    const patch = compact({
+      input: input !== undefined ? clean(input) : undefined,
+      output: phase.output !== undefined ? clean(phase.output) : undefined,
+      model: phase.model,
+      usageDetails: phase.usage ? usageDetails(phase.usage) : undefined,
+      metadata: compact({
+        provider: phase.provider,
+        stopReason: phase.stopReason,
+        contentSource: "agent transcript",
+      }),
+    });
+    if (patch.input !== undefined) entry.inputSet = true;
+    if (patch.output !== undefined) {
+      entry.outputSet = true;
+      entry.outputEventReceived = true;
+    }
+    if (complete) entry.contentReconciled = true;
+    try {
+      entry.obs.update(patch);
+    } catch {
+      // best-effort
+    }
+  }
+
+  function finishTimelineGeneration(entry, force = false) {
+    if (!entry?.timeline || entry.ended || !entry.modelCallTerminal) return;
+    if (!entry.modelCallStarted && !entry.fallbackCall && !entry.root?.runCompleted) {
+      return;
+    }
+    if (entry.modelCallOutcome !== "error" && !entry.root?.modelUsageReceived && !force) {
+      return;
+    }
+    if (
+      !force &&
+      conversationHooksEnabled &&
+      entry.modelCallOutcome !== "error" &&
+      !entry.contentReconciled
+    ) {
+      return;
+    }
+    // Keep the callId index until the TTL sweep so the diagnostic and typed
+    // hook streams can both report the same terminal call without duplication.
+    endEntry(entry, entry.completedMs ?? now(), true);
+  }
+
+  function reconcileTimeline(root, messages, force = false) {
+    if (!root || traceLayout !== "timeline") return;
+    const phases = timelinePhases(messages);
+    const successfulCalls = successfulModelCalls(root);
+    const callOffset = Math.max(0, successfulCalls.length - phases.length);
+    const phaseOffset = Math.max(0, phases.length - successfulCalls.length);
+    const count = Math.min(successfulCalls.length, phases.length);
+
+    for (let index = 0; index < count; index += 1) {
+      const entry = successfulCalls[callOffset + index];
+      const phase = phases[phaseOffset + index];
+      const fallbackInput =
+        callOffset + index === 0 ? initialTimelineInput(root) : undefined;
+      applyTimelinePhase(entry, phase, fallbackInput);
+      finishTimelineGeneration(entry);
+    }
+
+    if (phases.length === 0 && root.pendingLlmOutput && successfulCalls.length > 0) {
+      const pending = root.pendingLlmOutput;
+      const message = normalizeTimelineMessage(pending.lastAssistant);
+      const textOutput = Array.isArray(pending.assistantTexts)
+        ? pending.assistantTexts
+            .filter((text) => typeof text === "string" && text.trim())
+            .at(-1)
+        : undefined;
+      const output =
+        message ??
+        (textOutput ? { role: "assistant", content: textOutput } : undefined);
+      if (output) {
+        applyTimelinePhase(
+          successfulCalls.at(-1),
+          {
+            output: [output],
+            usage: successfulCalls.length === 1 ? pending.usage : undefined,
+            model: pending.model,
+            provider: pending.provider,
+          },
+          successfulCalls.length === 1 ? initialTimelineInput(root) : undefined,
+        );
+      }
+    }
+
+    if (force) {
+      for (const entry of root.modelCalls) {
+        finishTimelineGeneration(
+          entry,
+          entry.modelCallOutcome === "error" || root.modelUsageReceived,
+        );
+      }
+    }
+  }
+
+  function ensureModelCall(evt, source) {
+    const key = modelCallKey(evt);
+    let entry = key ? modelCallsByKey.get(key) : undefined;
+    if (!entry && evt?.callId) {
+      for (const candidate of new Set(modelCallsByKey.values())) {
+        if (candidate.callId !== evt.callId) continue;
+        if (candidate.runId && evt.runId && candidate.runId !== evt.runId) continue;
+        entry = candidate;
+        break;
+      }
+    }
+    if (entry) {
+      if (key) {
+        entry.modelCallKeys.add(key);
+        modelCallsByKey.set(key, entry);
+      }
+      return touch(entry);
+    }
+
+    const root = ensureRoot(evt);
+    const startMs =
+      source === "terminal" && typeof evt?.durationMs === "number"
+        ? evt.ts - evt.durationMs
+        : evt?.ts;
+    entry = createGeneration(
+      evt,
+      root,
+      {
+        input: root?.modelCalls.length === 0 ? initialTimelineInput(root) : undefined,
+        metadata: compact({
+          provider: evt?.provider,
+          runId: evt?.runId,
+          callId: evt?.callId,
+          api: evt?.api,
+          transport: evt?.transport,
+          traceLayout: "timeline",
+        }),
+      },
+      startMs,
+      "model-call",
+    );
+    entry.timeline = true;
+    entry.startedMs = startMs;
+    entry.callId = evt?.callId;
+    entry.modelCallKeys = new Set();
+    if (key) {
+      entry.modelCallKeys.add(key);
+      modelCallsByKey.set(key, entry);
+    }
+    if (root) {
+      root.modelCalls.push(entry);
+    }
+    return entry;
+  }
+
+  function ensureTimelineFallback(root) {
+    if (
+      !root ||
+      traceLayout !== "timeline" ||
+      root.modelCalls.length > 0 ||
+      !root.pendingLlmOutput
+    ) {
+      return;
+    }
+    const output = root.pendingLlmOutput;
+    const entry = ensureModelCall(
+      {
+        ...root.ctx,
+        ...output,
+        callId: `fallback:${root.runId ?? sessionOf(root.ctx) ?? "run"}`,
+        ts: root.llmInput?.ts ?? output.ts,
+      },
+      "started",
+    );
+    entry.modelCallStarted = true;
+    entry.modelCallTerminal = true;
+    entry.modelCallOutcome = "completed";
+    entry.completedMs = output.ts;
+    entry.fallbackCall = true;
+    try {
+      entry.obs.update({ metadata: { timingSource: "llm hooks" } });
+    } catch {
+      // best-effort
+    }
   }
 
   function generationForOutput(evt, root) {
@@ -542,6 +770,13 @@ export function createTraceEngine(tracing, opts = {}) {
         if (child.hookStarted && !child.hookTerminal) continue;
         finishTool(child, root);
       } else if (child.kind === "generation") {
+        if (child.timeline) {
+          finishTimelineGeneration(
+            child,
+            root.modelUsageReceived && (root.agentEnded || !conversationHooksEnabled),
+          );
+          continue;
+        }
         // A root may end before the outer model.usage event. Do not close a
         // hook-created generation until that diagnostic has supplied usage/cost.
         finishGeneration(child);
@@ -590,6 +825,45 @@ export function createTraceEngine(tracing, opts = {}) {
 
   function onModelUsage(evt) {
     const root = ensureRoot(evt);
+    if (traceLayout === "timeline" && root) {
+      if (root.modelCalls.length === 0) {
+        root.pendingModelUsage = evt;
+        return;
+      }
+      const target = successfulModelCalls(root).at(-1) ?? root.modelCalls.at(-1);
+      const aggregateUsage = usageDetails(evt.usage);
+      try {
+        target?.obs.update(
+          compact({
+            usageDetails:
+              root.modelCalls.length === 1 && !target.hookUsageSet
+                ? aggregateUsage
+                : undefined,
+            costDetails:
+              typeof evt.costUsd === "number" ? { totalCost: evt.costUsd } : undefined,
+            metadata: compact({
+              usageScope: root.modelCalls.length > 1 ? "run" : "model-call",
+              ...(root.modelCalls.length > 1 ? { turnUsage: aggregateUsage } : {}),
+              promptTokens: evt.usage?.promptTokens,
+              contextLimit: evt.context?.limit,
+              contextUsed: evt.context?.used,
+              durationMs: evt.durationMs,
+            }),
+          }),
+        );
+      } catch {
+        // best-effort
+      }
+      root.modelUsageReceived = true;
+      root.pendingModelUsage = undefined;
+      for (const generation of root.modelCalls) {
+        finishTimelineGeneration(
+          generation,
+          root.agentEnded || !conversationHooksEnabled,
+        );
+      }
+      return;
+    }
     const candidates = root ? generationList(root.runId, root) : generationList(evt?.runId);
     let entry = candidates.findLast((candidate) => !candidate.ended);
     if (!entry) {
@@ -636,7 +910,72 @@ export function createTraceEngine(tracing, opts = {}) {
     }
   }
 
+  function onModelCallStarted(evt) {
+    if (traceLayout !== "timeline") return;
+    const entry = ensureModelCall(evt, "started");
+    entry.modelCallStarted = true;
+    try {
+      entry.obs.update({
+        model: evt.model,
+        metadata: compact({
+          provider: evt.provider,
+          callId: evt.callId,
+          api: evt.api,
+          transport: evt.transport,
+          contextTokenBudget: evt.contextTokenBudget,
+          contextWindowSource: evt.contextWindowSource,
+          contextWindowReferenceTokens: evt.contextWindowReferenceTokens,
+        }),
+      });
+    } catch {
+      // best-effort
+    }
+    finishTimelineGeneration(entry);
+  }
+
+  function onModelCallEnded(evt) {
+    if (traceLayout !== "timeline") return;
+    const entry = ensureModelCall(evt, "terminal");
+    entry.modelCallTerminal = true;
+    entry.modelCallOutcome =
+      evt.outcome ?? (evt.type === "model.call.error" ? "error" : "completed");
+    entry.completedMs = evt.ts;
+    const isError = entry.modelCallOutcome === "error";
+    try {
+      entry.obs.update(
+        compact({
+          model: evt.model,
+          level: isError ? "ERROR" : undefined,
+          statusMessage: isError ? evt.errorCategory ?? evt.failureKind : undefined,
+          metadata: compact({
+            provider: evt.provider,
+            callId: evt.callId,
+            api: evt.api,
+            transport: evt.transport,
+            durationMs: evt.durationMs,
+            timeToFirstByteMs: evt.timeToFirstByteMs,
+            requestPayloadBytes: evt.requestPayloadBytes,
+            responseStreamBytes: evt.responseStreamBytes,
+            outcome: entry.modelCallOutcome,
+            errorCategory: evt.errorCategory,
+            failureKind: evt.failureKind,
+            upstreamRequestIdHash: evt.upstreamRequestIdHash,
+          }),
+        }),
+      );
+    } catch {
+      // best-effort
+    }
+    if (entry.root?.pendingModelUsage) onModelUsage(entry.root.pendingModelUsage);
+    if (isError) finishTimelineGeneration(entry, true);
+    else finishTimelineGeneration(entry);
+  }
+
   function onModelCallError(evt) {
+    if (traceLayout === "timeline" && evt?.callId) {
+      onModelCallEnded({ ...evt, outcome: "error" });
+      return;
+    }
     const root = ensureRoot(evt);
     endEntry(
       createChild(evt, root, {
@@ -811,6 +1150,48 @@ export function createTraceEngine(tracing, opts = {}) {
   function onLlmInput(evt) {
     const root = ensureRoot(evt);
     if (!captureConversationContent) return;
+    if (traceLayout === "timeline" && root) {
+      root.llmInput = {
+        ts: evt.ts,
+        model: evt.model,
+        provider: evt.provider,
+        prompt: clean(evt.prompt),
+        historyMessageCount: Array.isArray(evt.historyMessages)
+          ? evt.historyMessages.length
+          : undefined,
+        systemPromptChars:
+          typeof evt.systemPrompt === "string" ? evt.systemPrompt.length : undefined,
+        toolCount: Array.isArray(evt.tools) ? evt.tools.length : undefined,
+        imagesCount: evt.imagesCount,
+      };
+      const first = root.modelCalls[0];
+      if (first && !first.inputSet) {
+        const input = initialTimelineInput(root);
+        if (input !== undefined) {
+          first.inputSet = true;
+          try {
+            first.obs.update({ input: clean(input) });
+          } catch {
+            // best-effort
+          }
+        }
+      }
+      try {
+        root.obs.update({
+          metadata: compact({
+            generationInputMode: "incremental",
+            historyMessageCount: root.llmInput.historyMessageCount,
+            systemPromptChars: root.llmInput.systemPromptChars,
+            toolCount: root.llmInput.toolCount,
+            imagesCount: root.llmInput.imagesCount,
+          }),
+        });
+      } catch {
+        // best-effort
+      }
+      updateRootIO(root, { input: evt.prompt });
+      return;
+    }
     const list = generationList(evt.runId, root);
     let entry = list.find(
       (item) => !item.ended && !item.inputSet && (item.syntheticOutput || item.syntheticUsage),
@@ -843,6 +1224,55 @@ export function createTraceEngine(tracing, opts = {}) {
   function onLlmOutput(evt) {
     const root = ensureRoot(evt);
     if (!captureConversationContent) return;
+    if (traceLayout === "timeline" && root) {
+      const entry = successfulModelCalls(root).at(-1);
+      if (entry) {
+        const lastAssistant = normalizeTimelineMessage(evt.lastAssistant);
+        const fallbackText = Array.isArray(evt.assistantTexts)
+          ? evt.assistantTexts
+              .filter((text) => typeof text === "string" && text.trim())
+              .at(-1)
+          : undefined;
+        const output =
+          lastAssistant ??
+          (fallbackText ? { role: "assistant", content: fallbackText } : undefined);
+        if (output) {
+          applyTimelinePhase(
+            entry,
+            {
+              output: [output],
+              usage: root.modelCalls.length === 1 ? evt.usage : undefined,
+              model: evt.model,
+              provider: evt.provider,
+            },
+            root.modelCalls.length === 1 ? initialTimelineInput(root) : undefined,
+            root.modelCalls.length === 1,
+          );
+        }
+        entry.hookUsageSet = root.modelCalls.length === 1 && evt.usage !== undefined;
+        try {
+          entry.obs.update({
+            metadata: compact({
+              resolvedRef: evt.resolvedRef,
+              harnessId: evt.harnessId,
+              reasoningEffort: evt.reasoningEffort,
+              fastMode: evt.fastMode,
+            }),
+          });
+        } catch {
+          // best-effort
+        }
+        finishTimelineGeneration(entry);
+      } else {
+        root.pendingLlmOutput = evt;
+      }
+      if (root.pendingModelUsage) onModelUsage(root.pendingModelUsage);
+      const finalText = Array.isArray(evt.assistantTexts)
+        ? evt.assistantTexts.filter((text) => typeof text === "string" && text.trim()).at(-1)
+        : undefined;
+      if (finalText) root.llmOutputCandidate = clean(finalText);
+      return;
+    }
     const entry = generationForOutput(evt, root);
     entry.expectsHookIO = true;
     const output = outputFromLlmEvent(evt);
@@ -877,6 +1307,14 @@ export function createTraceEngine(tracing, opts = {}) {
   function onBeforeAgentFinalize(evt) {
     const root = ensureRoot(evt);
     if (!root || !captureConversationContent) return;
+    if (traceLayout === "timeline" && Array.isArray(evt.messages)) {
+      const messages =
+        Number.isInteger(root.agentStartMessageCount) &&
+        evt.messages.length >= root.agentStartMessageCount
+          ? evt.messages.slice(root.agentStartMessageCount)
+          : evt.messages;
+      reconcileTimeline(root, messages);
+    }
     const output =
       (typeof evt.lastAssistantMessage === "string" && evt.lastAssistantMessage.trim()) ||
       lastAssistantText(evt.messages);
@@ -886,14 +1324,20 @@ export function createTraceEngine(tracing, opts = {}) {
   function onAgentEnd(evt) {
     const root = ensureRoot(evt);
     if (!root) return;
-    let output;
-    if (captureConversationContent && evt.success !== false && !root.outputSet) {
-      const messages = Array.isArray(evt.messages) ? evt.messages : [];
-      const currentTurnMessages =
-        Number.isInteger(root.agentStartMessageCount) &&
-        messages.length >= root.agentStartMessageCount
+    const messages = Array.isArray(evt.messages) ? evt.messages : [];
+    const currentTurnMessages =
+      Number.isInteger(root.agentStartMessageCount) &&
+      messages.length >= root.agentStartMessageCount
         ? messages.slice(root.agentStartMessageCount)
         : messages;
+    root.agentEnded = true;
+    if (captureConversationContent && traceLayout === "timeline") {
+      ensureTimelineFallback(root);
+      reconcileTimeline(root, currentTurnMessages, true);
+      if (root.pendingModelUsage) onModelUsage(root.pendingModelUsage);
+    }
+    let output;
+    if (captureConversationContent && evt.success !== false && !root.outputSet) {
       output = lastAssistantText(currentTurnMessages);
     }
     if (output) updateRootIO(root, { output }, true);
@@ -967,6 +1411,12 @@ export function createTraceEngine(tracing, opts = {}) {
         case "model.call.error":
           onModelCallError(evt);
           return true;
+        case "model.call.started":
+          onModelCallStarted(evt);
+          return true;
+        case "model.call.completed":
+          onModelCallEnded({ ...evt, outcome: "completed" });
+          return true;
         case "model.usage":
           onModelUsage(evt);
           return true;
@@ -1006,6 +1456,12 @@ export function createTraceEngine(tracing, opts = {}) {
           return true;
         case "before_agent_run":
           onBeforeAgentRun(evt);
+          return true;
+        case "model_call_started":
+          onModelCallStarted(evt);
+          return true;
+        case "model_call_ended":
+          onModelCallEnded(evt);
           return true;
         case "llm_input":
           onLlmInput(evt);
