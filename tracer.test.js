@@ -86,7 +86,11 @@ function fakeTracing() {
  * explicitly (mirrors setImmediate firing after the synchronous event burst). */
 function makeEngine(t, opts = {}) {
   const deferred = [];
-  const engine = createTraceEngine(t, { defer: (fn) => deferred.push(fn), ...opts });
+  const engine = createTraceEngine(t, {
+    traceLayout: "legacy",
+    defer: (fn) => deferred.push(fn),
+    ...opts,
+  });
   const flushDeferred = () => {
     while (deferred.length) deferred.shift()();
   };
@@ -346,7 +350,12 @@ test("model.usage with no traceId creates a standalone generation root", () => {
 test("the reaper finalizes/ends observations idle past the TTL", () => {
   let clock = 0;
   const t = fakeTracing();
-  const engine = createTraceEngine(t, { now: () => clock, ttlMs: 1000, defer: () => {} });
+  const engine = createTraceEngine(t, {
+    traceLayout: "legacy",
+    now: () => clock,
+    ttlMs: 1000,
+    defer: () => {},
+  });
   engine.handle({ type: "run.started", ts: 0, runId: "r1", sessionId: "s", channel: "webchat", trace: { traceId: "T", spanId: "RUN" } });
   engine.handle({ type: "tool.execution.started", ts: 1, runId: "r1", toolName: "edit", toolCallId: "tc", trace: { traceId: "T", spanId: "TE", parentSpanId: "RUN" } });
   const root = t.roots()[0];
@@ -359,7 +368,7 @@ test("the reaper finalizes/ends observations idle past the TTL", () => {
 
 test("flushAll ends every live observation", () => {
   const t = fakeTracing();
-  const engine = createTraceEngine(t, { defer: () => {} });
+  const engine = createTraceEngine(t, { traceLayout: "legacy", defer: () => {} });
   engine.handle({ type: "run.started", ts: 0, runId: "r1", sessionId: "s", channel: "webchat", trace: { traceId: "T", spanId: "RUN" } });
   engine.handle({ type: "tool.execution.started", ts: 1, runId: "r1", toolName: "edit", toolCallId: "tc", trace: { traceId: "T", spanId: "TE", parentSpanId: "RUN" } });
   assert.ok(t.all.some((o) => !o.ended));
@@ -373,14 +382,18 @@ test("handler never throws and reports failures", () => {
     throw new Error("boom");
   };
   let logged = "";
-  const engine = createTraceEngine(t, { logger: { error: (m) => (logged = m) }, defer: () => {} });
+  const engine = createTraceEngine(t, {
+    traceLayout: "legacy",
+    logger: { error: (m) => (logged = m) },
+    defer: () => {},
+  });
   assert.equal(engine.handle({ type: "run.started", ts: 0, runId: "r", trace: { traceId: "T" } }), false);
   assert.match(logged, /handler failed/);
 });
 
 test("unknown event types are ignored", () => {
   const t = fakeTracing();
-  const engine = createTraceEngine(t, { defer: () => {} });
+  const engine = createTraceEngine(t, { traceLayout: "legacy", defer: () => {} });
   assert.equal(engine.handle({ type: "webhook.received" }), false);
   assert.equal(engine.handle(undefined), false);
   assert.equal(t.all.length, 0);
@@ -745,6 +758,275 @@ test("multiple llm hook pairs create separate generations", () => {
   assert.deepEqual(generations[0].attributes.usageDetails, { input: 5, output: 2 });
   assert.deepEqual(generations[1].attributes.costDetails, { totalCost: 0.1 });
   assert.ok(generations.every((generation) => generation.ended));
+});
+
+test("timeline layout interleaves one compact generation per model call with tools", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, {
+    traceLayout: "timeline",
+    conversationHooksEnabled: true,
+  });
+  const ctx = { runId: "rt", sessionId: "st", trace: { traceId: "TT" } };
+
+  engine.handleHook(
+    "before_agent_run",
+    { prompt: "find the issue", messages: [] },
+    ctx,
+  );
+  engine.handleHook(
+    "llm_input",
+    {
+      ts: 2,
+      model: "MiniMax-M3",
+      provider: "minimax",
+      prompt: "find the issue",
+      systemPrompt: "very large system prompt",
+      historyMessages: [{ role: "assistant", content: "old turn" }],
+      tools: [{ name: "exec", schema: { type: "object" } }],
+      imagesCount: 0,
+    },
+    ctx,
+  );
+  engine.handleHook(
+    "model_call_started",
+    { ts: 10, callId: "call-1", provider: "minimax", model: "MiniMax-M3" },
+    ctx,
+  );
+  engine.handleHook(
+    "model_call_ended",
+    {
+      ts: 20,
+      callId: "call-1",
+      provider: "minimax",
+      model: "MiniMax-M3",
+      durationMs: 10,
+      outcome: "completed",
+    },
+    ctx,
+  );
+  engine.handle({
+    type: "tool.execution.started",
+    ts: 21,
+    toolName: "exec",
+    toolCallId: "tc1",
+    ...ctx,
+  });
+  engine.handle({
+    type: "tool.execution.completed",
+    ts: 25,
+    durationMs: 4,
+    toolName: "exec",
+    toolCallId: "tc1",
+    ...ctx,
+  });
+  engine.handleHook(
+    "model_call_started",
+    { ts: 30, callId: "call-2", provider: "minimax", model: "MiniMax-M3" },
+    ctx,
+  );
+  engine.handleHook(
+    "model_call_ended",
+    {
+      ts: 40,
+      callId: "call-2",
+      provider: "minimax",
+      model: "MiniMax-M3",
+      durationMs: 10,
+      outcome: "completed",
+    },
+    ctx,
+  );
+  engine.handleHook(
+    "llm_output",
+    {
+      ts: 41,
+      model: "MiniMax-M3",
+      provider: "minimax",
+      assistantTexts: ["Found it."],
+      lastAssistant: { role: "assistant", content: [{ type: "text", text: "Found it." }] },
+      usage: { input: 25, output: 6 },
+    },
+    ctx,
+  );
+  engine.handleHook(
+    "agent_end",
+    {
+      success: true,
+      messages: [
+        { role: "user", content: "find the issue" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "search the repository" },
+            { type: "toolCall", id: "tc1", name: "exec", arguments: { command: "rg bug" } },
+          ],
+          usage: { input: 10, output: 2 },
+        },
+        {
+          role: "toolResult",
+          toolCallId: "tc1",
+          toolName: "exec",
+          content: [{ type: "text", text: "one match" }],
+        },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "the match explains it" },
+            { type: "text", text: "Found it." },
+          ],
+          usage: { input: 15, output: 4 },
+        },
+      ],
+    },
+    ctx,
+  );
+
+  const generations = t.all.filter((node) => node.opts.asType === "generation");
+  assert.equal(generations.length, 2);
+  assert.deepEqual(t.roots()[0].children.map((node) => node.name), [
+    "model-call",
+    "exec",
+    "model-call",
+  ]);
+  assert.deepEqual(generations[0].attributes.input, [
+    { role: "user", content: "find the issue" },
+  ]);
+  assert.equal(generations[0].attributes.input.systemPrompt, undefined);
+  assert.equal(generations[0].attributes.output[0].content[0].type, "reasoning");
+  assert.equal(generations[0].attributes.output[0].tool_calls[0].function.name, "exec");
+  assert.deepEqual(generations[1].attributes.input, [
+    {
+      role: "tool",
+      name: "exec",
+      tool_call_id: "tc1",
+      content: "one match",
+    },
+  ]);
+  assert.equal(generations[1].attributes.output[0].content[1].text, "Found it.");
+  assert.equal(generations[0].ended, false, "late aggregate usage can still update the trace");
+
+  engine.handle({
+    type: "model.usage",
+    ts: 45,
+    model: "MiniMax-M3",
+    provider: "minimax",
+    usage: { input: 25, output: 6 },
+    costUsd: 0.2,
+    ...ctx,
+  });
+
+  assert.ok(generations.every((generation) => generation.ended));
+  assert.deepEqual(generations[0].attributes.usageDetails, { input: 10, output: 2 });
+  assert.deepEqual(generations[1].attributes.usageDetails, { input: 15, output: 4 });
+  assert.deepEqual(generations[1].attributes.costDetails, { totalCost: 0.2 });
+  assert.deepEqual(generations[1].attributes.metadata.turnUsage, { input: 25, output: 6 });
+});
+
+test("timeline deduplicates diagnostic and typed model-call lifecycle streams", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, {
+    traceLayout: "timeline",
+    conversationHooksEnabled: false,
+  });
+  const ctx = { runId: "rdedupe", sessionId: "sdedupe", trace: { traceId: "TDEDUPE" } };
+
+  engine.handle({
+    type: "model.call.started",
+    ts: 10,
+    callId: "same-call",
+    model: "m",
+    provider: "p",
+    ...ctx,
+  });
+  engine.handleHook(
+    "model_call_started",
+    { ts: 11, callId: "same-call", model: "m", provider: "p" },
+    ctx,
+  );
+  engine.handle({
+    type: "model.call.completed",
+    ts: 20,
+    durationMs: 10,
+    callId: "same-call",
+    model: "m",
+    provider: "p",
+    ...ctx,
+  });
+  engine.handleHook(
+    "model_call_ended",
+    {
+      ts: 21,
+      durationMs: 10,
+      outcome: "completed",
+      callId: "same-call",
+      model: "m",
+      provider: "p",
+    },
+    ctx,
+  );
+  engine.handle({
+    type: "model.usage",
+    ts: 22,
+    model: "m",
+    provider: "p",
+    usage: { input: 1, output: 1 },
+    ...ctx,
+  });
+
+  const generations = t.all.filter((node) => node.opts.asType === "generation");
+  assert.equal(generations.length, 1);
+  assert.equal(generations[0].endTime.getTime(), 21);
+  assert.equal(generations[0].ended, true);
+  assert.equal(generations[0].ignoredUpdates.length, 0);
+});
+
+test("timeline tolerates usage and terminal events arriving before model-call start", () => {
+  const t = fakeTracing();
+  const { engine } = makeEngine(t, {
+    traceLayout: "timeline",
+    conversationHooksEnabled: false,
+  });
+  const ctx = { runId: "rreverse", sessionId: "sreverse", trace: { traceId: "TREVERSE" } };
+
+  engine.handle({
+    type: "model.usage",
+    ts: 30,
+    model: "m",
+    provider: "p",
+    usage: { input: 3, output: 1 },
+    costUsd: 0.01,
+    ...ctx,
+  });
+  engine.handle({
+    type: "model.call.completed",
+    ts: 20,
+    durationMs: 10,
+    callId: "reverse-call",
+    model: "m",
+    provider: "p",
+    ...ctx,
+  });
+
+  const generation = t.all.find((node) => node.opts.asType === "generation");
+  assert.equal(generation.ended, false, "a late start can still enrich the call");
+
+  engine.handle({
+    type: "model.call.started",
+    ts: 10,
+    callId: "reverse-call",
+    model: "m",
+    provider: "p",
+    api: "anthropic-messages",
+    ...ctx,
+  });
+
+  assert.equal(generation.ended, true);
+  assert.equal(generation.opts.startTime.getTime(), 10);
+  assert.equal(generation.endTime.getTime(), 20);
+  assert.deepEqual(generation.attributes.usageDetails, { input: 3, output: 1 });
+  assert.deepEqual(generation.attributes.costDetails, { totalCost: 0.01 });
+  assert.equal(generation.attributes.metadata.api, "anthropic-messages");
+  assert.equal(generation.ignoredUpdates.length, 0);
 });
 
 test("model.usage arriving before llm hooks does not create a duplicate generation", () => {

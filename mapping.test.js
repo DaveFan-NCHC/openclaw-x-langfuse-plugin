@@ -9,6 +9,8 @@ import {
   errorAttributes,
   sanitizeContent,
   lastAssistantText,
+  normalizeTimelineMessage,
+  timelinePhases,
 } from "./mapping.js";
 
 test("compact drops undefined and null", () => {
@@ -145,5 +147,102 @@ test("lastAssistantText ignores tool-only blocks and unwraps message rows", () =
       { message: { role: "assistant", content: [{ type: "text", text: "answer" }] } },
     ]),
     "answer",
+  );
+});
+
+test("normalizeTimelineMessage renders reasoning and tool calls as a compact chat message", () => {
+  assert.deepEqual(
+    normalizeTimelineMessage({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "inspect the repository", signature: "private" },
+        { type: "text", text: "I will inspect it." },
+        { type: "toolCall", id: "tc1", name: "exec", arguments: { command: "rg TODO" } },
+      ],
+      stopReason: "toolUse",
+    }),
+    {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "inspect the repository" },
+        { type: "text", text: "I will inspect it." },
+      ],
+      tool_calls: [
+        {
+          id: "tc1",
+          type: "function",
+          function: { name: "exec", arguments: '{"command":"rg TODO"}' },
+        },
+      ],
+    },
+  );
+});
+
+test("timelinePhases makes tool results the next generation's incremental input", () => {
+  assert.deepEqual(
+    timelinePhases([
+      { role: "user", content: "find the issue" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "search first" },
+          { type: "toolCall", id: "tc1", name: "exec", arguments: { command: "rg bug" } },
+        ],
+        usage: { input: 10, output: 2 },
+      },
+      {
+        role: "toolResult",
+        toolCallId: "tc1",
+        toolName: "exec",
+        content: [{ type: "text", text: "one match" }],
+      },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "the match explains it" },
+          { type: "text", text: "Found it." },
+        ],
+        usage: { input: 15, output: 4 },
+      },
+    ]),
+    [
+      {
+        input: [{ role: "user", content: "find the issue" }],
+        output: [
+          {
+            role: "assistant",
+            content: [{ type: "reasoning", text: "search first" }],
+            tool_calls: [
+              {
+                id: "tc1",
+                type: "function",
+                function: { name: "exec", arguments: '{"command":"rg bug"}' },
+              },
+            ],
+          },
+        ],
+        usage: { input: 10, output: 2 },
+      },
+      {
+        input: [
+          {
+            role: "tool",
+            name: "exec",
+            tool_call_id: "tc1",
+            content: "one match",
+          },
+        ],
+        output: [
+          {
+            role: "assistant",
+            content: [
+              { type: "reasoning", text: "the match explains it" },
+              { type: "text", text: "Found it." },
+            ],
+          },
+        ],
+        usage: { input: 15, output: 4 },
+      },
+    ],
   );
 });

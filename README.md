@@ -87,6 +87,7 @@ Content capture can be constrained independently:
 
 | Config field                  | Default | Effect |
 | ----------------------------- | ------- | ------ |
+| `traceLayout`                 | `timeline` | Create one compact generation per model call, interleaved with tools. Set to `legacy` for the previous run-wide generation. |
 | `captureConversationContent`  | `true`  | Capture agent and generation prompt/response content. |
 | `captureToolContent`          | `true`  | Capture tool arguments and results. |
 | `piiFiltering`                | `true`  | Locally redact high-confidence PII before captured content is exported. Set to `false` to disable. |
@@ -123,10 +124,16 @@ trace id.
   still open, the child is nested beneath it; otherwise it remains an
   independently correct observation with requester/parent metadata. A child
   never rewrites the initiating trace's input/output.
-- **Generation** — one observation per `llm_input`/`llm_output` hook pair.
-  `model.usage` supplements it with `usageDetails`, aggregate turn usage,
-  `costDetails.totalCost` (USD), timing, and provider metadata; it does not
-  supply prompt/response content.
+- **Generation** — in the default `timeline` layout, one observation per
+  `model_call_started`/`model_call_ended` pair. Generations use compact
+  incremental I/O reconstructed from the current-turn transcript: the first
+  call receives the user prompt, later calls receive only new tool results,
+  and assistant thinking/text/tool requests stay on the call that produced
+  them. Full system prompts, history, and tool schemas are summarized once on
+  the run metadata instead of repeated on every call. `model.usage` supplies
+  aggregate turn usage and `costDetails.totalCost` without duplicating cost
+  across calls. Set `traceLayout` to `legacy` to retain one observation per
+  `llm_input`/`llm_output` hook pair.
 - **Tool / Retriever** — one observation per `tool.execution.*`, named after the
   tool. Retrieval/search tools (vector search, RAG, grep, web fetch, memory
   recall, …) are classified as Langfuse `retriever` observations; everything else
@@ -157,7 +164,7 @@ OpenClaw delivers hooks and `tool.execution.*` events asynchronously
 (they're queued and can be dropped under heavy load), while `run.*` and
 `model.usage` are synchronous — so `run.completed` reaches the bridge *before*
 its own tool events, and `model.usage` arrives *after* it. The engine handles
-this with `traceId`, `runId`, `toolCallId`, `sessionId`, and `sessionKey`
+this with `traceId`, `runId`, `callId`, `toolCallId`, `sessionId`, and `sessionKey`
 indexes. A terminal event received before its start/hook enriches the same
 observation rather than creating a duplicate, and an idle reaper closes any
 observation orphaned by a dropped terminal event. Trace-only usage events are
@@ -174,6 +181,10 @@ import { startObservation, setLangfuseTracerProvider } from "@langfuse/tracing";
 import { createTraceEngine } from "./tracer.js";
 
 let engine;
+api.on("model_call_started", (event, ctx) =>
+  engine?.handleHook("model_call_started", event, ctx));
+api.on("model_call_ended", (event, ctx) =>
+  engine?.handleHook("model_call_ended", event, ctx));
 api.on("before_tool_call", (event, ctx) =>
   engine?.handleHook("before_tool_call", event, ctx));
 api.on("after_tool_call", (event, ctx) =>

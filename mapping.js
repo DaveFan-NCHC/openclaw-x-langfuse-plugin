@@ -236,6 +236,120 @@ export function lastAssistantText(messages) {
   return undefined;
 }
 
+function jsonString(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return "{}";
+  }
+}
+
+function normalizedContentBlock(block) {
+  if (typeof block === "string") return { type: "text", text: block };
+  if (!block || typeof block !== "object") return undefined;
+  const type = String(block.type ?? "");
+  if (type === "text" || type === "input_text" || type === "output_text") {
+    return typeof block.text === "string" ? { type: "text", text: block.text } : undefined;
+  }
+  if (type === "thinking" || type === "reasoning") {
+    const text = block.thinking ?? block.reasoning ?? block.text;
+    return typeof text === "string" ? { type: "reasoning", text } : undefined;
+  }
+  return block;
+}
+
+function normalizedToolCall(block) {
+  if (!block || typeof block !== "object") return undefined;
+  const type = String(block.type ?? "");
+  if (!["toolCall", "tool_call", "tool_use"].includes(type)) return undefined;
+  const name = block.name ?? block.toolName ?? block.function?.name;
+  const args =
+    block.arguments ?? block.args ?? block.input ?? block.function?.arguments ?? {};
+  return compact({
+    id: block.id ?? block.toolCallId,
+    type: "function",
+    function: compact({ name, arguments: jsonString(args) }),
+  });
+}
+
+/**
+ * Convert an OpenClaw transcript row to a compact chat-message shape that
+ * Langfuse renders readably. Provider-specific fields are deliberately omitted;
+ * the observation metadata retains model/provider/timing details.
+ */
+export function normalizeTimelineMessage(row) {
+  const message = row?.message ?? row;
+  if (!message || typeof message !== "object" || typeof message.role !== "string") {
+    return undefined;
+  }
+
+  const role = message.role === "toolResult" ? "tool" : message.role;
+  const contentBlocks = Array.isArray(message.content) ? message.content : undefined;
+  const toolCalls = [];
+  const content = [];
+  for (const block of contentBlocks ?? []) {
+    const toolCall = normalizedToolCall(block);
+    if (toolCall) toolCalls.push(toolCall);
+    else {
+      const normalized = normalizedContentBlock(block);
+      if (normalized) content.push(normalized);
+    }
+  }
+
+  const normalizedContent =
+    !contentBlocks
+      ? message.content
+      : content.length === 1 && content[0]?.type === "text"
+        ? content[0].text
+        : content;
+
+  return compact({
+    role,
+    content: normalizedContent,
+    name: message.name ?? message.toolName,
+    tool_call_id: message.toolCallId ?? message.tool_call_id,
+    tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+  });
+}
+
+/**
+ * Split one current-turn transcript into model phases. Each assistant message
+ * is a generation output; user/tool messages since the previous assistant are
+ * the compact incremental input for that generation.
+ */
+export function timelinePhases(messages) {
+  if (!Array.isArray(messages)) return [];
+  const phases = [];
+  let pendingInput = [];
+
+  for (const row of messages) {
+    const message = row?.message ?? row;
+    const normalized = normalizeTimelineMessage(row);
+    if (!message || !normalized) continue;
+    if (message.role === "assistant") {
+      phases.push(
+        compact({
+          input: pendingInput.length > 0 ? pendingInput : undefined,
+          output: [normalized],
+          usage: message.usage,
+          model: message.model ?? message.modelId,
+          provider: message.provider,
+          stopReason: message.stopReason ?? message.stop_reason,
+        }),
+      );
+      pendingInput = [];
+    } else if (
+      message.role === "user" ||
+      message.role === "tool" ||
+      message.role === "toolResult"
+    ) {
+      pendingInput.push(normalized);
+    }
+  }
+  return phases;
+}
+
 /**
  * Write trace-level name/sessionId onto an observation's root OTel span. We set
  * these straight on the span (rather than via `propagateAttributes`, which needs

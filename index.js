@@ -58,6 +58,7 @@ function resolveConfig(pluginConfig) {
     publicKey: cfg.publicKey ?? process.env.LANGFUSE_PUBLIC_KEY,
     secretKey: cfg.secretKey ?? process.env.LANGFUSE_SECRET_KEY,
     baseUrl: cfg.baseUrl ?? process.env.LANGFUSE_BASE_URL ?? DEFAULT_BASE_URL,
+    traceLayout: cfg.traceLayout === "legacy" ? "legacy" : "timeline",
     captureConversationContent: cfg.captureConversationContent !== false,
     captureToolContent: cfg.captureToolContent !== false,
     piiFiltering: cfg.piiFiltering !== false,
@@ -122,6 +123,7 @@ function createLangfuseBridgeService(getPluginConfig, pluginId) {
       engine = createTraceEngine(tracing, {
         logger: ctx.logger,
         conversationHooksEnabled,
+        traceLayout: config.traceLayout,
         captureConversationContent: config.captureConversationContent,
         captureToolContent: config.captureToolContent,
         piiFiltering: config.piiFiltering,
@@ -198,6 +200,7 @@ export default definePluginEntry({
     const config = resolveConfig(api.pluginConfig);
     registerBridgeHooks(api, {
       captureConversationContent: config.captureConversationContent,
+      traceLayout: config.traceLayout,
     });
     api.registerService(createLangfuseBridgeService(() => api.pluginConfig, api.id));
   },
