@@ -1,6 +1,6 @@
 {
   "name": "openclaw-x-langfuse-plugin",
-  "version": "1.6.0-NCHC",
+  "version": "1.7.0-NCHC",
   "description": "Correlate OpenClaw hooks and diagnostics in Langfuse",
   "type": "module",
   "main": "index.js",
