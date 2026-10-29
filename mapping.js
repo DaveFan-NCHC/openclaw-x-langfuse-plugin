@@ -416,6 +416,9 @@ export function runAttributes(evt) {
   return compact({
     metadata: compact({
       runId: evt.runId,
+      agentId: evt.agentId,
+      chatId: evt.chatId,
+      senderId: evt.senderId,
       provider: evt.provider,
       model: evt.model,
       trigger: evt.trigger,

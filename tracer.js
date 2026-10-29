@@ -264,9 +264,22 @@ export function createTraceEngine(tracing, opts = {}) {
       root.sessioned = true;
       if (!root.parentRoot) setTraceFields(root.obs, undefined, sessionOf(evt));
     }
+    const identityMetadata = {};
+    for (const field of ["agentId", "chatId", "senderId"]) {
+      if (!root.ctx[field] && evt?.[field]) {
+        root.ctx[field] = evt[field];
+        identityMetadata[field] = evt[field];
+      }
+    }
+    if (Object.keys(identityMetadata).length > 0) {
+      try {
+        root.obs.update({ metadata: identityMetadata });
+      } catch {
+        // best-effort
+      }
+    }
     root.ctx.sessionId ??= evt?.sessionId;
     root.ctx.sessionKey ??= evt?.sessionKey;
-    root.ctx.agentId ??= evt?.agentId;
     root.ctx.runId ??= evt?.runId;
     root.ctx.trace ??= evt?.trace;
     touch(root);
@@ -338,6 +351,8 @@ export function createTraceEngine(tracing, opts = {}) {
         sessionId: evt?.sessionId,
         sessionKey: evt?.sessionKey,
         agentId: evt?.agentId,
+        chatId: evt?.chatId,
+        senderId: evt?.senderId,
       },
       children: new Set(),
       generations: [],
@@ -386,10 +401,12 @@ export function createTraceEngine(tracing, opts = {}) {
   function updateSubagentMetadata(root, info) {
     if (!root || !info) return;
     root.subagent = info;
+    root.ctx.agentId ??= info.agentId;
     try {
       root.obs.update({
         metadata: compact({
           subagent: true,
+          agentId: info.agentId,
           childSessionKey: info.childSessionKey,
           requesterSessionKey: info.requesterSessionKey,
           parentRunId: info.parentRunId,

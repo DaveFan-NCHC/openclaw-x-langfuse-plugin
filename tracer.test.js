@@ -115,7 +115,7 @@ function runSequence() {
     { type: "tool.execution.started", ts: 1100, runId: "r1", toolName: "web_search", toolCallId: "tc1", toolSource: "core", trace: { traceId: TRACE, spanId: "T1", parentSpanId: "RUN" } },
     { type: "tool.execution.completed", ts: 1200, runId: "r1", toolName: "web_search", toolCallId: "tc1", durationMs: 100, trace: { traceId: TRACE, spanId: "T1", parentSpanId: "RUN" } },
     { type: "run.completed", ts: 1400, runId: "r1", sessionId: "s1", channel: "webchat", durationMs: 400, outcome: "completed", trace: { traceId: TRACE, spanId: "RUN", parentSpanId: "HARNESS" } },
-    { type: "model.usage", ts: 1410, durationMs: 400, sessionId: "s1", agentId: "main", channel: "webchat", model: "claude-opus-4-8", provider: "anthropic", usage: { input: 100, output: 50, total: 150 }, costUsd: 0.002, trace: { traceId: TRACE, spanId: "USAGE", parentSpanId: "HARNESS" } },
+    { type: "model.usage", ts: 1410, durationMs: 400, sessionId: "s1", agentId: "main", chatId: "chat-1", senderId: "sender-1", channel: "webchat", model: "claude-opus-4-8", provider: "anthropic", usage: { input: 100, output: 50, total: 150 }, costUsd: 0.002, trace: { traceId: TRACE, spanId: "USAGE", parentSpanId: "HARNESS" } },
   ];
 }
 
@@ -235,6 +235,9 @@ test("a full turn builds one trace with everything under a single root", () => {
   assert.equal(root.name, "webchat");
   assert.equal(root.spanAttrs["langfuse.trace.name"], "webchat");
   assert.equal(root.spanAttrs["session.id"], "s1");
+  assert.equal(root.attributes.metadata.agentId, "main");
+  assert.equal(root.attributes.metadata.chatId, "chat-1");
+  assert.equal(root.attributes.metadata.senderId, "sender-1");
   assert.equal(root.ended, true);
   assert.equal(root.traceIO, undefined);
 
@@ -1202,6 +1205,7 @@ test("subagent lifecycle links child I/O without changing parent trace I/O", () 
   const child = parent.children.find((node) => node.opts.asType === "agent");
   assert.ok(child);
   assert.equal(child.attributes.metadata.subagent, true);
+  assert.equal(child.attributes.metadata.agentId, "main");
   assert.equal(child.attributes.metadata.parentRunId, parentCtx.runId);
   assert.equal(child.attributes.input, "research this");
   assert.equal(child.attributes.output, "research result");

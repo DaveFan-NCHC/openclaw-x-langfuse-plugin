@@ -112,7 +112,8 @@ subagent runs. Different runs are never collapsed merely because they share a
 trace id.
 
 - **Turn root** (`agent`) — anchored by `run.started`/`run.completed`, with
-  `outcome` and `durationMs`. Its trace-level input/output mirror the turn's
+  `agentId`, `chatId`, and `senderId` metadata when available, plus `outcome`
+  and `durationMs`. Its trace-level input/output mirror the turn's
   prompt from `before_agent_run` and final response from `agent_end` or
   `before_agent_finalize`. (OpenClaw's per-event span parents are inconsistent
   — `model.usage` hangs off the harness span while tools hang off the run span —

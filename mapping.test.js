@@ -5,6 +5,7 @@ import {
   classifyToolType,
   usageDetails,
   toolAttributes,
+  runAttributes,
   contextSummary,
   errorAttributes,
   sanitizeContent,
@@ -56,6 +57,23 @@ test("toolAttributes carries source/owner/paramsSummary", () => {
   });
   assert.equal(attrs.metadata.toolSource, "mcp");
   assert.deepEqual(attrs.metadata.paramsSummary, { kind: "object" });
+});
+
+test("runAttributes carries OpenClaw agent and conversation identities", () => {
+  assert.deepEqual(
+    runAttributes({
+      runId: "r1",
+      agentId: "main",
+      chatId: "chat-1",
+      senderId: "sender-1",
+    }).metadata,
+    {
+      runId: "r1",
+      agentId: "main",
+      chatId: "chat-1",
+      senderId: "sender-1",
+    },
+  );
 });
 
 test("contextSummary formats present size fields and skips missing ones", () => {
