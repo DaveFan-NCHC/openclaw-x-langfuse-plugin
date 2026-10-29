@@ -29,6 +29,20 @@ third-party plugins never receive it.) The public listener delivers the
 `model.call.error` event bodies this bridge maps (minus private message content
 — see below).
 
+## Key differences from the original version
+
+This version uses OpenClaw hooks instead of directly reading and writing
+session or trajectory files. This provides several benefits:
+
+- Traces are built directly from runtime events, reducing the risk of losing
+  traces because of file rotation, truncation, or read timing.
+- Sandbox and subagent context and relationships can be captured.
+- Tool inputs and outputs are captured across the entire run, instead of being
+  limited to the first 50 tool interactions in the same session.
+- Additional metadata—including `agentId`, `chatId`, `senderId`, `runId`,
+  `callId`, `toolCallId`, and channel—is included for easier filtering and
+  investigation in Langfuse.
+
 ## Install
 
 ```bash
