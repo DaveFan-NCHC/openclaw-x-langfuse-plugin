@@ -104,6 +104,9 @@ Content capture can be constrained independently:
 | `traceLayout`                 | `timeline` | Create one compact generation per model call, interleaved with tools. Set to `legacy` for the previous run-wide generation. |
 | `captureConversationContent`  | `true`  | Capture agent and generation prompt/response content. |
 | `captureToolContent`          | `true`  | Capture tool arguments and results. |
+| `captureSystemPrompt`         | `false` | Capture the full system prompt on the first generation. |
+| `captureHistoryMessages`      | `false` | Capture the full pre-run conversation history on the first generation. This can include historical user messages. |
+| `captureToolDefinitions`      | `false` | Capture model-visible tool definitions and schemas on the first generation. This is separate from `captureToolContent`. |
 | `piiFiltering`                | `true`  | Locally redact high-confidence PII before captured content is exported. Set to `false` to disable. |
 | `maxContentBytes`             | `64000` | Maximum sanitized bytes per input/output field. |
 
@@ -145,7 +148,9 @@ trace id.
   call receives the user prompt, later calls receive only new tool results,
   and assistant thinking/text/tool requests stay on the call that produced
   them. Full system prompts, history, and tool schemas are summarized once on
-  the run metadata instead of repeated on every call. `model.usage` supplies
+  the run metadata instead of repeated on every call. When their capture settings
+  are enabled, the sanitized values are also attached to the first generation's
+  metadata. `model.usage` supplies
   aggregate turn usage and `costDetails.totalCost` without duplicating cost
   across calls. Set `traceLayout` to `legacy` to retain one observation per
   `llm_input`/`llm_output` hook pair.

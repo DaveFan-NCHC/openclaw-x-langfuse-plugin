@@ -37,6 +37,21 @@
         "default": true,
         "description": "Capture tool params/results from before_tool_call and after_tool_call."
       },
+      "captureSystemPrompt": {
+        "type": "boolean",
+        "default": false,
+        "description": "Capture the full system prompt on the first generation. Requires conversation access."
+      },
+      "captureHistoryMessages": {
+        "type": "boolean",
+        "default": false,
+        "description": "Capture the full pre-run conversation history on the first generation. Requires conversation access."
+      },
+      "captureToolDefinitions": {
+        "type": "boolean",
+        "default": false,
+        "description": "Capture model-visible tool definitions and schemas on the first generation. This is separate from captureToolContent and requires conversation access."
+      },
       "piiFiltering": {
         "type": "boolean",
         "default": true,

@@ -61,6 +61,9 @@ function resolveConfig(pluginConfig) {
     traceLayout: cfg.traceLayout === "legacy" ? "legacy" : "timeline",
     captureConversationContent: cfg.captureConversationContent !== false,
     captureToolContent: cfg.captureToolContent !== false,
+    captureSystemPrompt: cfg.captureSystemPrompt === true,
+    captureHistoryMessages: cfg.captureHistoryMessages === true,
+    captureToolDefinitions: cfg.captureToolDefinitions === true,
     piiFiltering: cfg.piiFiltering !== false,
     maxContentBytes:
       typeof cfg.maxContentBytes === "number" ? cfg.maxContentBytes : 64_000,
@@ -126,6 +129,9 @@ function createLangfuseBridgeService(getPluginConfig, pluginId) {
         traceLayout: config.traceLayout,
         captureConversationContent: config.captureConversationContent,
         captureToolContent: config.captureToolContent,
+        captureSystemPrompt: config.captureSystemPrompt,
+        captureHistoryMessages: config.captureHistoryMessages,
+        captureToolDefinitions: config.captureToolDefinitions,
         piiFiltering: config.piiFiltering,
         maxContentBytes: config.maxContentBytes,
       });

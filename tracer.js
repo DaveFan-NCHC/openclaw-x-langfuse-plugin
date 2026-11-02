@@ -78,6 +78,9 @@ export function createTraceEngine(tracing, opts = {}) {
     conversationHooksEnabled = false,
     captureConversationContent = true,
     captureToolContent = true,
+    captureSystemPrompt = false,
+    captureHistoryMessages = false,
+    captureToolDefinitions = false,
     traceLayout = "timeline",
     piiFiltering = true,
     maxContentBytes = 64_000,
@@ -560,6 +563,34 @@ export function createTraceEngine(tracing, opts = {}) {
     return prompt !== undefined ? [{ role: "user", content: prompt }] : undefined;
   }
 
+  function timelineInputMetadata(root) {
+    return compact({
+      systemPrompt: root?.llmInput?.systemPrompt,
+      historyMessages: root?.llmInput?.historyMessages,
+      tools: root?.llmInput?.tools,
+    });
+  }
+
+  function updateFirstTimelineInput(root) {
+    const first = root?.modelCalls?.[0];
+    if (!first || first.ended) return;
+    const input = initialTimelineInput(root);
+    const metadata = timelineInputMetadata(root);
+    if (input === undefined && Object.keys(metadata).length === 0) return;
+    const inputPatch = input !== undefined && !first.inputSet ? input : undefined;
+    if (inputPatch !== undefined) first.inputSet = true;
+    try {
+      first.obs.update(
+        compact({
+          input: inputPatch,
+          metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+        }),
+      );
+    } catch {
+      // best-effort
+    }
+  }
+
   function successfulModelCalls(root) {
     return (root?.modelCalls ?? [])
       .filter((entry) => entry.modelCallOutcome !== "error")
@@ -721,6 +752,7 @@ export function createTraceEngine(tracing, opts = {}) {
     }
     if (root) {
       root.modelCalls.push(entry);
+      if (root.modelCalls.length === 1) updateFirstTimelineInput(root);
     }
     return entry;
   }
@@ -1172,7 +1204,17 @@ export function createTraceEngine(tracing, opts = {}) {
         ts: evt.ts,
         model: evt.model,
         provider: evt.provider,
-        prompt: clean(evt.prompt),
+        systemPrompt:
+          captureSystemPrompt && evt.systemPrompt !== undefined
+            ? clean(evt.systemPrompt)
+            : undefined,
+        historyMessages:
+          captureHistoryMessages && evt.historyMessages !== undefined
+            ? clean(evt.historyMessages)
+            : undefined,
+        prompt: evt.prompt !== undefined ? clean(evt.prompt) : undefined,
+        tools:
+          captureToolDefinitions && evt.tools !== undefined ? clean(evt.tools) : undefined,
         historyMessageCount: Array.isArray(evt.historyMessages)
           ? evt.historyMessages.length
           : undefined,
@@ -1181,18 +1223,7 @@ export function createTraceEngine(tracing, opts = {}) {
         toolCount: Array.isArray(evt.tools) ? evt.tools.length : undefined,
         imagesCount: evt.imagesCount,
       };
-      const first = root.modelCalls[0];
-      if (first && !first.inputSet) {
-        const input = initialTimelineInput(root);
-        if (input !== undefined) {
-          first.inputSet = true;
-          try {
-            first.obs.update({ input: clean(input) });
-          } catch {
-            // best-effort
-          }
-        }
-      }
+      updateFirstTimelineInput(root);
       try {
         root.obs.update({
           metadata: compact({
@@ -1213,15 +1244,14 @@ export function createTraceEngine(tracing, opts = {}) {
     let entry = list.find(
       (item) => !item.ended && !item.inputSet && (item.syntheticOutput || item.syntheticUsage),
     );
-    const input = clean(
-      compact({
-        systemPrompt: evt.systemPrompt,
-        prompt: evt.prompt,
-        historyMessages: evt.historyMessages,
-        tools: evt.tools,
-        imagesCount: evt.imagesCount,
-      }),
-    );
+    const selectedInput = compact({
+      systemPrompt: captureSystemPrompt ? evt.systemPrompt : undefined,
+      historyMessages: captureHistoryMessages ? evt.historyMessages : undefined,
+      prompt: evt.prompt,
+      tools: captureToolDefinitions ? evt.tools : undefined,
+      imagesCount: evt.imagesCount,
+    });
+    const input = clean(selectedInput);
     if (!entry) entry = createGeneration(evt, root, { input });
     else {
       entry.inputSet = true;

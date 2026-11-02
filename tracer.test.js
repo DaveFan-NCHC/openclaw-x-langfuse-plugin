@@ -138,6 +138,143 @@ test("PII filtering is applied to captured conversation content", () => {
   });
 });
 
+test("optional generation inputs are disabled by default while user prompt remains captured", () => {
+  for (const traceLayout of ["timeline", "legacy"]) {
+    const t = fakeTracing();
+    const engine = createTraceEngine(t, {
+      traceLayout,
+      conversationHooksEnabled: true,
+      defer: () => {},
+    });
+    const ctx = {
+      runId: `default-off-${traceLayout}`,
+      sessionId: `session-${traceLayout}`,
+      trace: { traceId: `trace-${traceLayout}` },
+    };
+
+    engine.handleHook(
+      "before_agent_run",
+      {
+        prompt: "private current prompt",
+        systemPrompt: "private fallback system prompt",
+        messages: [{ role: "user", content: "private historical prompt" }],
+      },
+      ctx,
+    );
+    engine.handleHook(
+      "llm_input",
+      {
+        prompt: "private current prompt",
+        systemPrompt: "private system prompt",
+        historyMessages: [{ role: "assistant", content: "private history" }],
+        tools: [{ name: "private_tool", schema: { type: "object" } }],
+      },
+      ctx,
+    );
+    if (traceLayout === "timeline") {
+      engine.handleHook(
+        "model_call_started",
+        { callId: "default-off-call", model: "m" },
+        ctx,
+      );
+      engine.handleHook(
+        "agent_end",
+        {
+          success: true,
+          messages: [
+            { role: "user", content: "private current prompt" },
+            { role: "assistant", content: "public answer" },
+          ],
+        },
+        ctx,
+      );
+    }
+
+    const root = t.roots()[0];
+    const generation = t.all.find((node) => node.opts.asType === "generation");
+    assert.equal(root.attributes.input, "private current prompt", traceLayout);
+    assert.equal(root.traceIO?.input, "private current prompt", traceLayout);
+    assert.deepEqual(
+      generation.attributes.input,
+      traceLayout === "timeline"
+        ? [{ role: "user", content: "private current prompt" }]
+        : { prompt: "private current prompt" },
+      traceLayout,
+    );
+    assert.equal(generation.attributes.metadata.systemPrompt, undefined, traceLayout);
+    assert.equal(generation.attributes.metadata.historyMessages, undefined, traceLayout);
+    assert.equal(generation.attributes.metadata.tools, undefined, traceLayout);
+  }
+});
+
+test("generation input capture settings are independent in both layouts", () => {
+  const cases = [
+    ["captureSystemPrompt", "systemPrompt", "actual system prompt"],
+    [
+      "captureHistoryMessages",
+      "historyMessages",
+      [{ role: "assistant", content: "actual history" }],
+    ],
+    [
+      "captureToolDefinitions",
+      "tools",
+      [{ name: "exec", schema: { type: "object" } }],
+    ],
+  ];
+
+  for (const traceLayout of ["timeline", "legacy"]) {
+    for (const [setting, field, expectedValue] of cases) {
+      const t = fakeTracing();
+      const engine = createTraceEngine(t, {
+        traceLayout,
+        conversationHooksEnabled: true,
+        [setting]: true,
+        defer: () => {},
+      });
+      const ctx = {
+        runId: `${traceLayout}-${setting}`,
+        trace: { traceId: `${traceLayout}-${setting}` },
+      };
+      engine.handleHook(
+        "before_agent_run",
+        { prompt: "actual user prompt", messages: [] },
+        ctx,
+      );
+      engine.handleHook(
+        "llm_input",
+        {
+          systemPrompt: "actual system prompt",
+          historyMessages: [{ role: "assistant", content: "actual history" }],
+          prompt: "actual user prompt",
+          tools: [{ name: "exec", schema: { type: "object" } }],
+        },
+        ctx,
+      );
+      if (traceLayout === "timeline") {
+        engine.handleHook(
+          "model_call_started",
+          { callId: `${setting}-call`, model: "m" },
+          ctx,
+        );
+      }
+
+      const generation = t.all.find((node) => node.opts.asType === "generation");
+      if (traceLayout === "timeline") {
+        assert.deepEqual(generation.attributes.input, [
+          { role: "user", content: "actual user prompt" },
+        ]);
+        assert.deepEqual(generation.attributes.metadata[field], expectedValue);
+      } else {
+        assert.deepEqual(generation.attributes.input, {
+          [field]: expectedValue,
+          prompt: "actual user prompt",
+        });
+      }
+      assert.equal(t.roots()[0].traceIO?.input, "actual user prompt");
+    }
+  }
+});
+
 test("run.completed finalizes with conversation hooks enabled when agent_end is missing", () => {
   const t = fakeTracing();
   const { engine, flushDeferred } = makeEngine(t, { conversationHooksEnabled: true });
@@ -406,6 +543,7 @@ test("hooks remain authoritative after more than 64 session messages", () => {
   const t = fakeTracing();
   const { engine, feed } = makeEngine(t, {
     conversationHooksEnabled: true,
+    captureHistoryMessages: true,
   });
   const ctx = {
     runId: "r65",
@@ -768,6 +906,9 @@ test("timeline layout interleaves one compact generation per model call with too
   const { engine } = makeEngine(t, {
     traceLayout: "timeline",
     conversationHooksEnabled: true,
+    captureSystemPrompt: true,
+    captureHistoryMessages: true,
+    captureToolDefinitions: true,
   });
   const ctx = { runId: "rt", sessionId: "st", trace: { traceId: "TT" } };
 
@@ -894,7 +1035,13 @@ test("timeline layout interleaves one compact generation per model call with too
   assert.deepEqual(generations[0].attributes.input, [
     { role: "user", content: "find the issue" },
   ]);
-  assert.equal(generations[0].attributes.input.systemPrompt, undefined);
+  assert.equal(generations[0].attributes.metadata.systemPrompt, "very large system prompt");
+  assert.deepEqual(generations[0].attributes.metadata.historyMessages, [
+    { role: "assistant", content: "old turn" },
+  ]);
+  assert.deepEqual(generations[0].attributes.metadata.tools, [
+    { name: "exec", schema: { type: "object" } },
+  ]);
   assert.equal(generations[0].attributes.output[0].content[0].type, "reasoning");
   assert.equal(generations[0].attributes.output[0].tool_calls[0].function.name, "exec");
   assert.deepEqual(generations[1].attributes.input, [
