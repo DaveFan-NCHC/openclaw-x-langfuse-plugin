@@ -39,6 +39,8 @@ session or trajectory files. This provides several benefits:
 - Sandbox and subagent context and relationships can be captured.
 - Tool inputs and outputs are captured across the entire run, instead of being
   limited to the first 50 tool interactions in the same session.
+- High-confidence PII is detected and redacted locally before captured content
+  is exported.
 - Additional metadata—including `agentId`, `chatId`, `senderId`, `runId`,
   `callId`, `toolCallId`, and channel—is included for easier filtering and
   investigation in Langfuse.
